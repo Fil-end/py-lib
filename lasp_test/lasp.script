@@ -1,0 +1,15 @@
+#!/bin/sh
+#BSUB -n 8               
+#BSUB -R "span[hosts=1]"  ### ask for 1 node
+#BSUB -q long
+#BSUB -o %J.out
+#BSUB -e %J.err
+#BSUB -W 72:00
+#BSUB -J lasp
+
+#export OMP_NUM_THREADS=2
+cd $LS_SUBCWD
+NP=`echo $LSB_HOSTS | wc -w`
+source /opt/intelstart.sh
+mpirun -np $NP /data/apps/lasp/lasp 
+
