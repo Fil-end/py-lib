@@ -24,7 +24,7 @@ from ase.constraints import FixAtoms
 from ase.calculators.emt import EMT
 from ase import Atoms
 from ase.io import read, write
-from ase.optimize import QuasiNewton
+from ase.optimize import QuasiNewton, LBFGS, LBFGSLineSearch
 import gym
 import math
 import copy
@@ -35,6 +35,10 @@ from math import cos, sin
 import random
 from random import sample
 from ase.geometry.analysis import Analysis
+
+# use Painn description
+import GNN_utils.Painn_utils as Painn
+
 # from slab import images
 
 '''
@@ -51,7 +55,7 @@ from ase.geometry.analysis import Analysis
         7     Dissociation
 
         '''
-slab = fcc100('Pd', size=(6, 6, 4), vacuum=20.0)
+slab = fcc100('Pd', size=(4, 4, 4), vacuum=10.0)
 '''delList = [108, 109, 110, 111, 112, 113, 114, 119, 120, 125, 126,
            131, 132, 137, 138, 139, 140, 141, 142, 143]
 del slab[[i for i in range(len(slab)) if i in delList]]'''
@@ -66,8 +70,9 @@ DIRECTION = [
     np.array([0, 0, -1]),
 ]
 # 设定动作空间
-# ACTION_SPACES = ['ADS', 'Translation', 'R_Rotation', 'L_Rotation', 'MD', 'Diffusion', 'Drill', 'Dissociation', 'Desportion']
-ACTION_SPACES = ['ADS', 'MD', 'Diffusion', 'Drill', 'Dissociation', 'Desportion']
+ACTION_SPACES = ['ADS', 'Translation', 'R_Rotation', 'L_Rotation', 'MD', 'Diffusion', 'Drill', 'Dissociation', 'Desportion']
+# ACTION_SPACES = ['ADS', 'Translation', 'R_Rotation', 'L_Rotation', 'Diffusion', 'Drill', 'Dissociation', 'Desportion']
+# ACTION_SPACES = ['ADS', 'MD', 'Diffusion', 'Drill', 'Dissociation', 'Desportion']
 # TODO:
 '''
     3.add "LAT_TRANS" part into step(considered in the cluster situation)
@@ -86,18 +91,37 @@ class MCTEnv(gym.Env):
                  max_episodes=None,
                  step_size=0.1,
                  max_energy_profile = 0.05,
-                 convergence = 0.01,
+                 convergence = 0.0075,
                  save_every=None,
                  save_every_min=None,
                  plot_every=None,
                  reaction_H = None,         #/(KJ/mol)
                  reaction_n = None,
                  delta_s = None,            #/eV
-                 use_DESW = None):
+                 use_DESW = None,
+                 level = None,
+                 use_GNN_description = None,
+                 cutoff = 4.0,  # Painn paras
+                 hidden_state_size = 50,
+                 embedding_size = 50,
+                 num_interactions = 3,
+                 calculator_method = None,
+                 model_path = None,
+                 pot = 'PdO',
+                 metal_ele = 'Pd'):
         
+        # loading the model
+        self.model_path = model_path
+
+        self.pot = pot
+        self.metal_ele = metal_ele
+
         self.initial_state = slab.copy()  # 设定初始结构
         self.to_constraint(self.initial_state)
-        self.initial_state, self.energy, self.force = self.lasp_calc(self.initial_state)  # 由于使用lasp计算，设定初始能量
+        # self.initial_state, self.energy, self.force = self.lasp_calc(self.initial_state)  # 由于使用lasp计算，设定初始能量
+        self.initial_state, self.energy, self.force = self.mace_calc(self.initial_state)
+
+        self.len_surf_atom = len(self.get_surf_atoms(self.initial_state))
 
         self.episode = 0  # 初始化episode为0
         self.max_episodes = max_episodes
@@ -115,7 +139,19 @@ class MCTEnv(gym.Env):
         
         # self.H = 112690 * 32/ 96485   # 没有加入熵校正, 单位eV
         self.reaction_H = reaction_H
-        self.reaction_n = reaction_n
+        if level:
+            if level == "Extremely Easy":
+                self.reaction_n = int(0.5 * self.len_surf_atom)
+            elif level == "Easy":   # only oxide surf metal_atoms
+                self.reaction_n = int(1.0 * self.len_surf_atom)
+            elif level == "Medium": # paritally oxide sub_metal_atoms
+                self.reaction_n = int(1.5 * self.len_surf_atom)
+            elif level == "Hard":  # oxide sub_metal_atoms
+                self.reaction_n = int(2.0 * self.len_surf_atom)
+            elif level == "Extremely Hard": # begin to oxide deep_metal_atoms
+                self.reaction_n = int(2.5 * self.len_surf_atom)
+        else:
+            self.reaction_n = reaction_n
         self.delta_s = delta_s
         self.H = self.reaction_H * self.reaction_n
 
@@ -150,11 +186,18 @@ class MCTEnv(gym.Env):
         self.k = k  # eV/K
         self.thermal_energy = k * temperature * self.len_atom
 
+        # Painn paras
+        self.cutoff = cutoff
+        self.hidden_state_size = hidden_state_size  # embedding_output_dim and the hidden_dim overall the Painn
+        self.num_interactions = num_interactions
+        self.embedding_size = embedding_size    # embedding_hidden_dim
+
         self.action_space = spaces.Discrete(len(ACTION_SPACES))
 
         # 设定动作空间，‘action_type’为action_space中的独立动作,atom_selection为三层Pd layer和环境中的16个氧
         # movement设定为单个原子在空间中的运动（x,y,z）
         # 定义动作空间
+        self.use_GNN_description = use_GNN_description
         self.observation_space = self.get_observation_space()
 
         # 一轮过后重新回到初始状态
@@ -165,14 +208,15 @@ class MCTEnv(gym.Env):
     def step(self, action):
         pro = 1  # 定义该step完成该动作的概率，初始化为1
         barrier = 0
-        self.steps = 50  # 定义优化的最大步长
+        self.steps = 100  # 定义优化的最大步长
         reward = 0  # 定义初始奖励为0
 
         diffusable = 1
         self.action_idx = action
         RMSD_similar = False
         kickout = False
-        RMSE = 10
+        RMSE_energy = 10
+        RMSE_RMSD = 10
 
         self.done = False  # 开关，决定episode是否结束
         done_similar = False
@@ -186,6 +230,7 @@ class MCTEnv(gym.Env):
         self.lamada_layer = 0.6
         self.lamada_env = 0
 
+        target_get = False
 
         assert self.action_space.contains(self.action_idx), "%r (%s) invalid" % (
             self.action_idx,
@@ -198,7 +243,7 @@ class MCTEnv(gym.Env):
         #   定义保存ts，min和md动作时的文件路径
         save_path_ts = None
         save_path_ads = None
-        save_path_md = None
+        save_path_md = 'md.traj'
 
         self.top_s, self.bridge_s, self.hollow_s, self.total_s, constraint, self.layer_atom, self.surf_atom, self.sub_atom, self.deep_atom, self.envList = self.get_surf_sites(
             self.atoms)
@@ -220,16 +265,13 @@ class MCTEnv(gym.Env):
         for i in subList:
             if self.atoms[i].symbol == 'O':
                 sub_O.append(i)
-        
-        if not bool(layer_O) and self.action_idx == 6:
-            self.action_idx = 1
                         
         '''——————————————————————————————————————————以下是动作选择————————————————————————————————————————————————————————'''
         if self.action_idx == 0:
             self.atoms = self.choose_ads_site(self.atoms, self.total_s)
             # return new_state,new_state_energy
 
-            '''elif self.action_idx == 1:
+        elif self.action_idx == 1:
 
             initial_positions = self.atoms.positions
 
@@ -255,7 +297,7 @@ class MCTEnv(gym.Env):
             matrix = np.array(matrix)
 
             for atom in initial_state.positions:
-                if 24.5 < atom[2] < 44.0 :
+                if 14.5 < atom[2] < 24.0 :
                     atom += np.array(
                         (np.dot(matrix, (np.array(atom.tolist()) - central_point).T).T + central_point).tolist()) - atom
             self.atoms.positions = initial_state.get_positions()
@@ -273,13 +315,13 @@ class MCTEnv(gym.Env):
 
             for atom in initial_state.positions:
 
-                if 24.5 < atom[2] < 44.0:
+                if 14.5 < atom[2] < 24.0:
                     atom += np.array(
                         (np.dot(matrix, (np.array(atom.tolist()) - central_point).T).T + central_point).tolist()) - atom
-            self.atoms.positions = initial_state.get_positions()'''
+            self.atoms.positions = initial_state.get_positions()
 
 
-        elif self.action_idx == 1:
+        elif self.action_idx == 4:
             self.atoms.set_constraint(constraint)
             self.atoms.calc = EMT()
             dyn = Langevin(self.atoms, 5 * units.fs, self.temperature_K * units.kB, 0.002, trajectory=save_path_md,
@@ -288,10 +330,12 @@ class MCTEnv(gym.Env):
 
             '''------------The above actions are muti-actions and the following actions contain single-atom actions--------------------------------'''
 
-        elif self.action_idx == 2:  # 表面上氧原子的扩散，单原子行为
-            self.atoms, diffusable = self.to_diffuse_oxygen(self.atoms, self.total_s)
+        elif self.action_idx == 5:  # 表面上氧原子的扩散，单原子行为
+            self.atoms, action_done = self.to_diffuse_oxygen(self.atoms, self.total_s)
+            if not action_done:
+                reward -= 1
 
-        elif self.action_idx == 3:  # 表面晶胞的扩大以及氧原子的钻洞，多原子行为+单原子行为
+        elif self.action_idx == 6:  # 表面晶胞的扩大以及氧原子的钻洞，多原子行为+单原子行为
             selected_drill_O_list = []
             layer_O_atom_list = self.layer_O_atom_list(self.atoms)
             sub_O_atom_list = self.sub_O_atom_list(self.atoms)
@@ -305,24 +349,24 @@ class MCTEnv(gym.Env):
             if selected_drill_O_list:
                 selected_O = selected_drill_O_list[np.random.randint(len(selected_drill_O_list))]
 
-                self.atoms = self.to_expand_lattice(self.atoms, 1.25, 1.25, 1.1)
+                # self.atoms = self.to_expand_lattice(self.atoms, 1.25, 1.25, 1.1)
 
                 if selected_O in layer_O_atom_list:
                     self.atoms = self.to_drill_surf(self.atoms)
                 elif selected_O in sub_O_atom_list:
                     self.atoms = self.to_drill_deep(self.atoms)
 
-                self.to_constraint(self.atoms)
-                self.atoms, _, _ = self.lasp_calc(self.atoms)
-                self.atoms = self.to_expand_lattice(self.atoms, 0.8, 0.8, 10/11)
+                # self.to_constraint(self.atoms)
+                # self.atoms, _, _ = self.lasp_calc(self.atoms)
+                # self.atoms, _, _ = self.mace_calc(self.atoms)
+                # self.atoms = self.to_expand_lattice(self.atoms, 0.8, 0.8, 10/11)
             else:
-                self.atoms = self.choose_ads_site(self.atoms, self.total_s)
                 reward -= 1
 
-        elif self.action_idx == 4:  # 氧气解离
+        elif self.action_idx == 7:  # 氧气解离
             self.atoms = self.O_dissociation(self.atoms)
 
-        elif self.action_idx == 5:
+        elif self.action_idx == 8:
             _,  desorblist = self.to_desorb_adsorbate(self.atoms)
             if desorblist:
                 self.atoms = self.choose_ads_to_desorb(self.atoms)
@@ -333,35 +377,44 @@ class MCTEnv(gym.Env):
             print('No such action')
 
         self.timestep += 1
+
+        previous_atom = self.trajectories[-1]
+
+        exist_too_short_bonds = self.exist_too_short_bonds(self.atoms)
+        if exist_too_short_bonds:
+            self.atoms = previous_atom
+            reward -= 5
         
         self.to_constraint(self.atoms)
    
         # 优化该state的末态结构以及next_state的初态结构
-        self.atoms, current_energy, current_force = self.lasp_calc(self.atoms)
-        self.top_s, self.bridge_s, self.hollow_s, self.total_s, constraint, self.layer_atom, self.surf_atom, self.sub_atom, self.deep_atom, self.envList = self.get_surf_sites(
+        # self.atoms, current_energy, current_force = self.lasp_calc(self.atoms)
+        self.atoms, current_energy, current_force = self.mace_calc(self.atoms)
+        # from traj2arc import traj2arc
+        # traj2arc('allstr_tmp_{}.arc'.format(self.timestep))
+
+        '''self.top_s, self.bridge_s, self.hollow_s, self.total_s, constraint, self.layer_atom, self.surf_atom, self.sub_atom, self.deep_atom, self.envList = self.get_surf_sites(
             self.atoms)
         free_atoms = []
         for i in range(len(self.atoms)):
             if i not in constraint.index:
                 free_atoms.append(i)
-        len_atom = len(free_atoms)
-        previous_atom = self.trajectories[-1]
+        len_atom = len(free_atoms)'''
+        
+
+        if self.action_idx in [1, 2, 3, 5, 6, 7]: 
+            barrier = self.check_TS(previous_atom, self.atoms, previous_energy, current_energy, self.action_idx)    # according to Boltzmann probablity distribution
+            if barrier > 5:
+                reward += -5.0 / (self.H * self.k * self.temperature_K)
+                barrier = 5.0
+            else:
+                # reward += math.tanh(-relative_energy /(self.H * 8.314 * self.temperature_K)) * (math.pow(10.0, 5))
+                reward +=  -barrier / (self.H * self.k * self.temperature_K)
+
 
         # kickout the structure if too similar
-        if self.RMSD(self.atoms, previous_atom)[0] and (current_energy - previous_energy) > 0:
-            self.atoms = previous_atom
-            current_energy = previous_energy
-            RMSD_similar = True
-            
-        if self.timestep > 3:
-            if self.RMSD(self.atoms, self.trajectories[-2])[0] and (current_energy - self.history['energies'][-2]) > 0:
-                self.atoms = previous_atom
-                current_energy = previous_energy
-                RMSD_similar = True
-                reward -= 1
-
-        if self.timestep > 21:
-            if self.RMSD(self.atoms, self.trajectories[-20])[0] and (current_energy - self.history['energies'][-20]) > 0: 
+        if self.timestep > 11:
+            if self.RMSD(self.atoms, self.trajectories[-10])[0] and (current_energy - self.history['energies'][-10]) > 0: 
                 self.atoms = previous_atom
                 current_energy = previous_energy
                 RMSD_similar = True
@@ -375,16 +428,16 @@ class MCTEnv(gym.Env):
             current_energy = previous_energy
             kickout = True
             # current_force = self.history['forces'][-1]
-            reward += -5
+            reward += -3
 
         if self.action_idx == 0:
             current_energy = current_energy - self.delta_s
             self.adsorb_history['traj'] = self.adsorb_history['traj'] + [self.atoms.copy()]
-            self.adsorb_history['structure'] = self.adsorb_history['structure'] + [self.atoms.get_positions()]
+            self.adsorb_history['structure'] = self.adsorb_history['structure'] + [self.atoms.get_scaled_positions()[self.free_atoms, :].flatten()]
             self.adsorb_history['energy'] = self.adsorb_history['energy'] + [current_energy - previous_energy]
             self.adsorb_history['timesteps'].append(self.history['timesteps'][-1] + 1)
 
-        if self.action_idx == 5:
+        if self.action_idx == 8:
             current_energy = current_energy + self.delta_s
 
         relative_energy = current_energy - previous_energy
@@ -408,15 +461,7 @@ class MCTEnv(gym.Env):
             elif result and self.action_idx != current_action_list[0]:
                 self.repeat_action = 0
       
-        if self.action_idx in [2,3,4]: 
-            barrier = self.check_TS(previous_atom, self.atoms, previous_energy, current_energy, self.action_idx)    # according to Boltzmann probablity distribution
-            if barrier > 5:
-                reward += self.get_reward_trans(5.0)
-                barrier = 5.0
-            else:
-                # reward += math.tanh(-relative_energy /(self.H * 8.314 * self.temperature_K)) * (math.pow(10.0, 5))
-                reward += self.get_reward_trans(relative_energy)
-
+        
         current_structure = self.atoms.get_positions()
 
         self.energy = current_energy
@@ -430,20 +475,10 @@ class MCTEnv(gym.Env):
 
         self.history, self.trajectories = self.update_history(self.action_idx, kickout)
 
-        '''sub_Pd_list = []
-        sub_list = self.label_atoms(self.atoms, [sub_z - fluct_d_Pd, sub_z + fluct_d_Pd])
-        for i in self.atoms:
-            if i.index in sub_list and i.symbol == 'Pd':
-                sub_Pd_list.append(i.index)
-        if len(sub_Pd_list) > 25:
-            reward -= (len(sub_Pd_list) - 25) * 5
-        else:
-            reward += 5'''
-
         env_Pd_list = []
-        env_list = self.label_atoms(self.atoms, [43.33, 45.83])
+        env_list = self.label_atoms(self.atoms, [23.33, 25.83])
         for i in self.atoms:    #查找是否Pd原子游离在环境中
-            if i.index in env_list and i.symbol == 'Pd':
+            if i.index in env_list and i.symbol == self.metal_ele:
                 env_Pd_list.append(i.index)
         
         exist_too_short_bonds = self.exist_too_short_bonds(self.atoms)
@@ -458,43 +493,28 @@ class MCTEnv(gym.Env):
                 self.done = True
                 reward -= 0.5 * self.timesteps
                 
-        if -2.0 * relative_energy > self.max_RE:
-            self.max_RE = -2.0 * relative_energy
+        if -1.5 * relative_energy > self.max_RE:
+            self.max_RE = -1.5 * relative_energy
             
         if len(self.history['actions']) - 1 >= self.total_steps:    # 当步数大于时间步，停止，且防止agent一直选取扩散或者平动动作
             self.done = True
             
 
-        '''Pd_z = []
-        O_z = []
-        for i in range(len(self.atoms)):
-            if self.atoms[i].symbol == 'Pd':
-                Pd_z.append(self.atoms.positions[i][2])
-            if self.atoms[i].symbol == 'O':
-                O_z.append(self.atoms.positions[i][2])
-
-        highest_Pd_z = max(Pd_z)
-        highest_O_z = max(O_z)
-        lowest_O_z = min(O_z)
-        ana = Analysis(self.atoms)
-        OObonds = ana.get_bonds('O', 'O', unique = True)
-
-        if not OObonds[0]:  # 若表层以及次表层的氧都以氧原子的形式存在，加分
-            if highest_O_z < highest_Pd_z and lowest_O_z > 12.0:
-                reward += 50'''
-
-#        reward -= 0.5 # 每经历一步timesteps，扣一分
-
         # _,  exist = self.to_ads_adsorbate(self.atoms)
         if len(self.history['real_energies']) > 11:
-            RMSE = self.RMSE(self.history['real_energies'][-10:])
-            if RMSE < 1.0:
+            RMSE_energy = self.RMSE(self.history['real_energies'][-10:])
+            RMSE_RMSD = self.RMSE(self.RMSD_list[-10:])
+            if RMSE_energy < 1.0 and RMSE_RMSD < 0.5:
                 done_similar = True
 
-        if (((current_energy - self.initial_energy) <= -0.95 * self.H and (current_energy - self.initial_energy) >= -1.1 * self.H) and (abs(current_energy - previous_energy) < self.min_RE_d and abs(current_energy - previous_energy) > 0.0001)) or (((current_energy - self.initial_energy) <= -0.9 * self.H and (current_energy - self.initial_energy) >= -1.2 * self.H) and done_similar):   # 当氧气全部被吸附到Pd表面，且两次相隔的能量差小于一定阈值，达到终止条件
+            '''if RMSE_energy < self.min_RE_d * 2 / 3 and RMSE_RMSD < 0.5 * 2/3:
+                done_similar = True'''
+
+        if ((current_energy - self.initial_energy) <= -1.0 * self.H and (abs(current_energy - previous_energy) < self.min_RE_d and abs(current_energy - previous_energy) > 0.0001)) and done_similar and self.RMSD_list[-1] < 0.5:   # 当氧气全部被吸附到Pd表面，且两次相隔的能量差小于一定阈值，达到终止条件
         # if abs(current_energy - previous_energy) < self.min_RE_d and abs(current_energy - previous_energy) > 0.001:    
             self.done = True
-            reward -= (self.energy - self.initial_energy)/(self.H * self.k * self.temperature_K)
+            target_get = True
+            reward -= (self.energy - self.initial_energy + self.H) * self.H /(self.H * self.k * self.temperature_K)
             # self.min_RE_d = abs(current_energy - previous_energy)
         
         self.history['reward'] = self.history['reward'] + [reward]
@@ -506,19 +526,20 @@ class MCTEnv(gym.Env):
         if self.done:
             episode_over = True
             self.episode += 1
-            if self.episode % self.save_every == 0:
+            if self.episode % self.save_every == 0 or target_get:
                 self.save_episode()
                 self.plot_episode()
 
         
-        return observation, reward, episode_over, [done_similar]
+        return observation, reward, episode_over, [target_get]
 
 
     def save_episode(self):
         save_path = os.path.join(self.history_dir, '%d.npz' % self.episode)
+        # traj = self.trajectories,
         np.savez_compressed(
             save_path,
-            traj = self.trajectories,
+            
             initial_energy=self.initial_energy,
             energies=self.history['energies'],
             actions=self.history['actions'],
@@ -573,7 +594,8 @@ class MCTEnv(gym.Env):
         self.atoms = slab.copy()
 
         self.to_constraint(self.atoms)
-        self.atoms, self.initial_energy, self.initial_force= self.lasp_calc(self.atoms)
+        # self.atoms, self.initial_energy, self.initial_force= self.lasp_calc(self.atoms)
+        self.atoms, self.initial_energy, self.initial_force= self.mace_calc(self.atoms)
 
         self.action_idx = 0
         self.episode_reward = 0.5 * self.timesteps
@@ -663,11 +685,12 @@ class MCTEnv(gym.Env):
         return
 
     def get_observation_space(self):
-        observation_space = spaces.Dict({'structures':
+        if self.use_GNN_description:
+            observation_space = spaces.Dict({'structures':
             spaces.Box(
                 low=-1,
                 high=2,
-                shape=(self.len_atom * 3, ),
+                shape=(len(self.initial_state), ),
                 dtype=float
             ),
             'energy': spaces.Box(
@@ -679,7 +702,7 @@ class MCTEnv(gym.Env):
             'force':spaces.Box(
                 low=-2,
                 high=2,
-                shape=(self.len_atom * 3, ),
+                shape=(len(self.initial_state), ),
                 dtype=float
             ),
             'TS': spaces.Box(low = -0.5,
@@ -687,14 +710,43 @@ class MCTEnv(gym.Env):
                                     shape = (1,),
                                     dtype=float),
         })
+        else:
+            observation_space = spaces.Dict({'structures':
+                spaces.Box(
+                    low=-1,
+                    high=2,
+                    shape=(self.len_atom * 3, ),
+                    dtype=float
+                ),
+                'energy': spaces.Box(
+                    low=-50.0,
+                    high=5.0,
+                    shape=(1,),
+                    dtype=float
+                ),
+                'force':spaces.Box(
+                    low=-2,
+                    high=2,
+                    shape=(self.len_atom * 3, ),
+                    dtype=float
+                ),
+                'TS': spaces.Box(low = -0.5,
+                                        high = 1.5,
+                                        shape = (1,),
+                                        dtype=float),
+            })
         return observation_space
 
     def get_obs(self):
         observation = {}
-        observation['structure'] = self.atoms.get_scaled_positions()[self.free_atoms, :].flatten()
-        observation['energy'] = np.array([self.energy - self.initial_energy]).reshape(1, )
-        # observation['force'] = self.force[self.free_atoms, :].flatten()
-        return observation['structure']
+        if self.use_GNN_description:
+            observation['structure_scalar'], observation['structure_vector'] = self._use_Painn_description(self.atoms)
+            observation['energy'] = np.array([self.energy - self.initial_energy]).reshape(1, )
+            return observation['structure_scalar'], observation['structure_vector']
+        else:
+            observation['structure'] = self.atoms.get_scaled_positions()[self.free_atoms, :].flatten()
+            observation['energy'] = np.array([self.energy - self.initial_energy]).reshape(1, )
+            return observation['structure']
 
     def update_history(self, action_idx, kickout):
         self.trajectories.append(self.atoms.copy())
@@ -710,45 +762,53 @@ class MCTEnv(gym.Env):
         return self.history, self.trajectories
 
     def transition_state_search(self, previous_atom, current_atom, previous_energy, current_energy, action):
-        layerlist = self.label_atoms(previous_atom, [26.0, 31.0])
+        layerlist = self.label_atoms(previous_atom, [16.0, 21.0])
         layer_O = []
         for i in layerlist:
             if previous_atom[i].symbol == 'O':
                 layer_O.append(i)
 
+        if current_energy - previous_energy > 5.0:
+            current_energy = previous_energy + 5.0
+
         if self.use_DESW:
-            self.to_constraint(previous_atom)
-            write_arc([previous_atom])
-
-            write_arc([previous_atom, current_atom])
-            previous_atom.calc = LASP(task='TS', pot='PdO', potential='NN D3')
-
-            if previous_atom.get_potential_energy() == 0:  #没有搜索到过渡态
-                ts_energy = previous_energy
+            if previous_energy == current_energy:
+                barrier = 0
+                ts_energy = previous_energy + barrier
             else:
-                # ts_atom = read_arc('TSstr.arc',index = -1)
-                barrier, ts_energy = previous_atom.get_potential_energy()
+                self.to_constraint(previous_atom)
+                write_arc([previous_atom])
+
+                write_arc([previous_atom, current_atom])
+                previous_atom.calc = LASP(task='TS', pot=self.pot, potential='NN D3')
+
+                if previous_atom.get_potential_energy() == 0:  #没有搜索到过渡态
+                    ts_energy = previous_energy
+                    barrier = 0
+                else:
+                    # ts_atom = read_arc('TSstr.arc',index = -1)
+                    barrier, _ = previous_atom.get_potential_energy()
+                    ts_energy = previous_energy + barrier
             # barrier = ts_energy - previous_energy
 
         else:
-            '''if action == 1:
+            if action == 1:
                 if current_energy - previous_energy < -1.0:
                     barrier = 0
                 elif current_energy - previous_energy >= -1.0 and current_energy - previous_energy <= 1.0:
-                    barrier = np.random.normal(2, 2/3)
+                    barrier = np.random.normal(1.5, 0.5)
                 else:
-                    barrier = 4.0
+                    barrier = 3.0
 
             if action == 2 or action == 3:
-                barrier = math.log(1 + pow(math.e, current_energy-previous_energy), 10)'''
-            if action == 2:
+                barrier = math.log(1 + pow(math.e, current_energy-previous_energy), 10)
+            if action == 5:
                 barrier = math.log(0.5 + 1.5 * pow(math.e, 2 *(current_energy - previous_energy)), 10)
-            elif action == 3:
+            elif action == 6:
                 barrier = 0.93 * pow(math.e, 0.615 * (current_energy - previous_energy)) - 0.16
-            elif action == 4:
+            elif action == 7:
                 barrier = 0.65 + 0.84 * (current_energy - previous_energy)
-            else:
-                barrier = 1.5
+
             ts_energy = previous_energy + barrier
 
         return barrier, ts_energy
@@ -793,37 +853,25 @@ class MCTEnv(gym.Env):
             ads_site = add_total_sites[np.random.randint(len(add_total_sites))]
             new_state = state.copy()
             ads,  _ = self.to_ads_adsorbate(new_state)
-            # env_List = self.label_atoms(new_state, [env_z - 2.0, env_z+2.0])
-            '''env_2 = self.label_atoms(new_state, [0.0, 4.0])
-            for i in env_2:
-                env_List.append(i)
-            env_s = state.copy()
-
-            del env_s[[i for i in range(len(env_s)) if i not in env_List]]
-            env_index = min(env_List)'''
+            
             if len(ads):
                 if len(ads) == 2:
                     delstatelist = [ads[0], ads[1]]
+                    for atom in new_state:
+                        if atom.index == delstatelist[0]:
+                            atom.position = np.array([ads_site[0], ads_site[1], ads_site[2] + 1.3])
+                        elif atom.index == delstatelist[1]:
+                            atom.position = np.array([ads_site[0], ads_site[1], ads_site[2] + 2.51])
                 elif len(ads) == 3:
                     delstatelist = [ads[0], ads[1], ads[2]]
-            del new_state[[i for i in range(len(new_state)) if i in delstatelist]]
+                    for atom in new_state:
+                        if atom.index == delstatelist[0]:
+                            atom.position = np.array([ads_site[0], ads_site[1], ads_site[2] + 1.3])
+                        elif atom.index == delstatelist[1]:
+                            atom.position = np.array([ads_site[0], ads_site[1] + 1.09, ads_site[2] + 1.97])
+                        elif atom.index == delstatelist[2]:
+                            atom.position = np.array([ads_site[0], ads_site[1] - 1.09, ads_site[2] + 1.97])
 
-            # delenvlist = [0, 1]
-            # del env_s[[i for i in range(len(env_s)) if i in delenvlist]]
-            if len(ads):
-                if len(ads) == 2:
-                    O1 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + 1.3))
-                    O2 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + 2.51))
-                    new_state = new_state + O1
-                    new_state = new_state + O2
-                    # ads = O1 + O2
-                elif len(ads) == 3:
-                    O1 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + 1.3))
-                    O2 = Atom('O', (ads_site[0], ads_site[1] + 1.09, ads_site[2] + 1.97))
-                    O3 = Atom('O', (ads_site[0], ads_site[1] - 1.09, ads_site[2] + 1.97))
-                    new_state = new_state + O1
-                    new_state = new_state + O2
-                    new_state = new_state + O3
         return new_state
     
     def choose_ads_to_desorb(self, state):
@@ -854,22 +902,27 @@ class MCTEnv(gym.Env):
                 O_position.append(state.get_positions()[i][1])
                 O_position.append(state.get_positions()[i][2])
 
-            del new_state[[i for i in range(len(new_state)) if i in desorblist]]
+            # del new_state[[i for i in range(len(new_state)) if i in desorblist]]
 
             if len(desorb):
                 if len(desorb) == 2:
-                    O1 = Atom('O', (O_position[0], O_position[1], O_position[2] + 6.0))
-                    O2 = Atom('O', (O_position[3], O_position[4], O_position[5] + 6.0))
-                    new_state = new_state + O1
-                    new_state = new_state + O2
-                    # ads = O1 + O2
+                    delstatelist = [desorb[0], desorb[1]]
+                    for atom in new_state:
+                        if atom.index == delstatelist[0]:
+                            atom.position = np.array([O_position[0], O_position[1], O_position[2] + 5.0])
+                        elif atom.index == delstatelist[1]:
+                            atom.position = np.array([O_position[3], O_position[4], O_position[5] + 5.0])
+
                 elif len(desorb) == 3:
-                    O1 = Atom('O', (O_position[0], O_position[1], O_position[2] + 6.0))
-                    O2 = Atom('O', (O_position[3], O_position[4], O_position[5] + 6.0))
-                    O3 = Atom('O', (O_position[6], O_position[7], O_position[8] + 6.0))
-                    new_state = new_state + O1
-                    new_state = new_state + O2
-                    new_state = new_state + O3
+                    delstatelist = [desorb[0], desorb[1], desorb[2]]
+                    for atom in new_state:
+                        if atom.index == delstatelist[0]:
+                            atom.position = np.array([O_position[0], O_position[1], O_position[2] + 5.0])
+                        elif atom.index == delstatelist[1]:
+                            atom.position = np.array([O_position[3], O_position[4] + 1.09, O_position[5] + 5.0])
+                        elif atom.index == delstatelist[2]:
+                            atom.position = np.array([O_position[6], O_position[7] - 1.09, O_position[2] + 5.0])
+
         return new_state
 
     def get_surf_sites(self, slab):
@@ -885,7 +938,7 @@ class MCTEnv(gym.Env):
         deepList = self.label_atoms(state, [deep_z - fluct_d_Pd, deep_z + fluct_d_Pd])
         bottomList = self.label_atoms(state, [bottom_z - fluct_d_Pd, bottom_z + fluct_d_Pd])
         envList = self.label_atoms(state, [env_z - 2.0, env_z + 2.0])
-        env_2 = self.label_atoms(state, [0.0,  19.0])
+        env_2 = self.label_atoms(state, [0.0,  9.0])
         for i in env_2:
             envList.append(i)
 
@@ -910,7 +963,7 @@ class MCTEnv(gym.Env):
         del env[[i for i in range(len(env)) if i not in envList]]
 
         constraint = FixAtoms(mask=[a.symbol != 'O' and a.index in bottomList for a in slab])
-        constraint_1 = FixAtoms(mask=[a.symbol != 'Pd' and a.index in envList for a in slab])
+        constraint_1 = FixAtoms(mask=[a.symbol != self.metal_ele and a.index in envList for a in slab])
         # constraint_deepatomlist = sample(deepList, int(len(deepList)/2))
         # constraint_2 = FixAtoms(mask=[a.symbol != 'O' and a.index in constraint_deepatomlist for a in slab])
         # constraint_1.index = np.append(constraint_1.index, constraint_2.index)
@@ -959,21 +1012,18 @@ class MCTEnv(gym.Env):
         return top_sites, bridge_sites, hollow_sites, total_surf_sites, constraint, layer_atom, surf_atom, sub_atom, deep_atom, envList
 
     def to_diffuse_oxygen(self, slab, surf_sites):
-        layer_O = []
         to_diffuse_O_list = []
-        layer_List = self.label_atoms(slab, [layer_z - fluct_d_layer, layer_z + fluct_d_layer])
         diffusable_sites = []
         interference_O_distance = []
         diffusable = True
+        action_done = True
 
-        for i in slab:
-            if i.index in layer_List and i.symbol == 'O':
-                layer_O.append(i.index)
+        single_layer_O_list = self.layer_O_atom_list(slab)
         
         for ads_sites in surf_sites:    # 寻找可以diffuse的位点
             to_other_O_distance = []
-            if layer_O:
-                for i in layer_O:
+            if single_layer_O_list:
+                for i in single_layer_O_list:
                     distance = self.distance(ads_sites[0], ads_sites[1], ads_sites[2] + 1.5, slab.get_positions()[i][0],
                                            slab.get_positions()[i][1], slab.get_positions()[i][2])
                     to_other_O_distance.append(distance)
@@ -986,10 +1036,10 @@ class MCTEnv(gym.Env):
             if ads_sites[4]:
                 diffusable_sites.append(ads_sites)
 
-        if layer_O: # 防止氧原子被trap住无法diffuse
-            for i in layer_O:
+        if single_layer_O_list: # 防止氧原子被trap住无法diffuse
+            for i in single_layer_O_list:
                 to_other_O_distance = []
-                for j in layer_O:
+                for j in single_layer_O_list:
                     if j != i:
                         distance = self.distance(slab.get_positions()[i][0],
                                            slab.get_positions()[i][1], slab.get_positions()[i][2],slab.get_positions()[j][0],
@@ -1002,14 +1052,16 @@ class MCTEnv(gym.Env):
                         to_diffuse_O_list.append(i)
                 else:
                     to_diffuse_O_list.append(i)
+        else:
+            action_done = False
 
-        if to_diffuse_O_list:
-            selected_O_index = layer_O[np.random.randint(len(to_diffuse_O_list))]
+        if to_diffuse_O_list and action_done:
+            selected_O_index = single_layer_O_list[np.random.randint(len(to_diffuse_O_list))]
             if diffusable_sites:
                 diffuse_site = diffusable_sites[np.random.randint(len(diffusable_sites))]
             else:
                 diffuse_site = slab.get_positions()[selected_O_index]
-            interference_O_list = [i for i in layer_O if i != selected_O_index]
+            interference_O_list = [i for i in single_layer_O_list if i != selected_O_index]
             for j in interference_O_list:
                 d = self.atom_to_traj_distance(slab.positions[selected_O_index], diffuse_site, slab.positions[j])
                 interference_O_distance.append(d)
@@ -1018,11 +1070,15 @@ class MCTEnv(gym.Env):
                     diffusable = False
         
             if diffusable:
-                del slab[[j for j in range(len(slab)) if j == selected_O_index]]
-                O = Atom('O', (diffuse_site[0], diffuse_site[1], diffuse_site[2] + 1.5))
-                slab = slab + O
+                for atom in slab:
+                    if atom.index == selected_O_index:
+                        atom.position = np.array([diffuse_site[0], diffuse_site[1], diffuse_site[2] + 1.5])
+
+        else:
+            action_done = False
+
             
-        return slab, diffusable
+        return slab, action_done
 
     def to_expand_lattice(self, slab, expand_layer, expand_surf, expand_lattice):
 
@@ -1084,8 +1140,6 @@ class MCTEnv(gym.Env):
         layer_O = []
         to_distance = []
         drillable_sites = []
-        layer_O_atom_list = []
-        layer_OObond_list = []
         layer_List = self.label_atoms(slab, [layer_z - fluct_d_layer, layer_z + fluct_d_layer])
 
         sub_sites = self.get_sub_sites(slab)
@@ -1112,22 +1166,12 @@ class MCTEnv(gym.Env):
 
         
         if layer_O:
-            ana = Analysis(slab)
-            OObonds = ana.get_bonds('O','O',unique = True)
-            if OObonds[0]:
-                for i in OObonds[0]:
-                    if i[0] in layer_O and i[1] in layer_O:
-                        layer_OObond_list.append(i[0])
-                        layer_OObond_list.append(i[1])
-
-            for j in layer_O:
-                if j not in layer_OObond_list:
-                    layer_O_atom_list.append(j)
+            layer_O_atom_list = self.layer_O_atom_list(slab)
 
         if layer_O_atom_list:
-            i = layer_O[np.random.randint(len(layer_O_atom_list))]
+            i = layer_O_atom_list[np.random.randint(len(layer_O_atom_list))]
             position = slab.get_positions()[i]
-            del slab[[j for j in range(len(slab)) if j == i]]
+            # del slab[[j for j in range(len(slab)) if j == i]]
             for drill_site in drillable_sites:
                 to_distance.append(
                             self.distance(position[0], position[1], position[2], drill_site[0], drill_site[1],
@@ -1135,23 +1179,13 @@ class MCTEnv(gym.Env):
 
         if to_distance:
             drill_site = drillable_sites[to_distance.index(min(to_distance))]
-            O = Atom('O', (drill_site[0], drill_site[1], drill_site[2] +1.3))
-            slab = slab + O
+            for atom in slab:
+                if atom.index == i:
+                    atom.position = np.array([drill_site[0], drill_site[1], drill_site[2] +1.3])
 
-            lifted_atoms_list = []
-            current_surfList = self.label_atoms(slab, [surf_z - fluct_d_Pd/2, surf_z + fluct_d_Pd])
-            c_layerList = self.label_atoms(slab, [layer_z - fluct_d_layer, layer_z + fluct_d_layer])
-            current_layer_O = []
-            for i in slab:
-                if i.index in c_layerList and i.symbol == 'O':
-                    current_layer_O.append(i.index)
-            if current_layer_O:
-                for i in current_layer_O:
-                    current_surfList.append(i)
-            for i in current_surfList:
-                lifted_atoms_list.append(i)
+            lifted_atoms_list = self.label_atoms(slab, [surf_z - 1.0, layer_z + fluct_d_layer])
             for j in lifted_atoms_list:
-                slab.positions[j][2] += 1.0
+                slab.positions[j][2] += 0.5
         return slab
     
     def to_drill_deep(self, slab):
@@ -1164,14 +1198,11 @@ class MCTEnv(gym.Env):
 
         deep_sites = self.get_deep_sites(slab)
 
-        '''for i in slab:
-            if i.index in sub_List and i.symbol == 'O':
-                sub_O.append(i.index)'''
         
         for ads_sites in deep_sites:
             to_other_O_distance = []
-            if sub_O_atom_list:
-                for i in sub_O_atom_list:
+            if sub_List:
+                for i in sub_List:
                     distance = self.distance(ads_sites[0], ads_sites[1], ads_sites[2] + 1.3, slab.get_positions()[i][0],
                                            slab.get_positions()[i][1], slab.get_positions()[i][2])
                     to_other_O_distance.append(distance)
@@ -1184,24 +1215,10 @@ class MCTEnv(gym.Env):
             if ads_sites[4]:
                 drillable_sites.append(ads_sites)
 
-        
-        '''if sub_O:
-            ana = Analysis(slab)
-            OObonds = ana.get_bonds('O','O',unique = True)
-            if OObonds[0]:
-                for i in OObonds[0]:
-                    if i[0] in sub_O and i[1] in sub_O:
-                        layer_OObond_list.append(i[0])
-                        layer_OObond_list.append(i[1])
-
-            for j in sub_O:
-                if j not in layer_OObond_list:
-                    layer_O_atom_list.append(j)'''
-
         if sub_O_atom_list:
             i = sub_O_atom_list[np.random.randint(len(sub_O_atom_list))]
             position = slab.get_positions()[i]
-            del slab[[j for j in range(len(slab)) if j == i]]
+            # del slab[[j for j in range(len(slab)) if j == i]]
             for drill_site in drillable_sites:
                 to_distance.append(
                             self.distance(position[0], position[1], position[2], drill_site[0], drill_site[1],
@@ -1209,8 +1226,10 @@ class MCTEnv(gym.Env):
 
         if to_distance:
             drill_site = drillable_sites[to_distance.index(min(to_distance))]
-            O = Atom('O', (drill_site[0], drill_site[1], drill_site[2] +1.3))
-            slab = slab + O
+            for atom in slab:
+                if atom.index == i:
+                    atom.position = np.array([drill_site[0], drill_site[1], drill_site[2] +1.3])
+
 
             lifted_atoms_list = self.label_atoms(slab, [sub_z - 1.0, layer_z + fluct_d_layer])
             # current_surfList = self.label_atoms(slab, [surf_z - fluct_d_Pd/2, surf_z + fluct_d_Pd])
@@ -1226,14 +1245,14 @@ class MCTEnv(gym.Env):
             for i in current_sub_surfList:
                 lifted_atoms_list.append(i)'''
             for j in lifted_atoms_list:
-                slab.positions[j][2] += 1.0
+                slab.positions[j][2] += 0.5
         return slab
 
     def O_dissociation(self, slab):
         ana = Analysis(slab)
 
         OOBonds = ana.get_bonds('O', 'O', unique = True)
-        PdOBonds = ana.get_bonds('Pd', 'O', unique=True)
+        PdOBonds = ana.get_bonds(self.metal_ele, 'O', unique=True)
 
         Pd_O_list = []
         dissociate_O2_list = []
@@ -1249,10 +1268,13 @@ class MCTEnv(gym.Env):
 
         if dissociate_O2_list:
             OO = dissociate_O2_list[np.random.randint(len(dissociate_O2_list))]
+            print(OO)
             # d = ana.get_values([OO])[0]
             zeta = self.get_angle_with_z(slab, OO) * 180/ math.pi -5
-            fi = 30
+            fi = 0
+            # print('Before rotating the atoms positions are:', slab.get_positions()[OO[0][0]], slab.get_positions()[OO[0][1]])
             slab = self.oxy_rotation(slab, OO, zeta, fi)
+            # print('Before expanding the atoms positions are:', slab.get_positions()[OO[0][0]], slab.get_positions()[OO[0][1]])
             slab = self.to_dissociate(slab, OO)
         return slab
     
@@ -1272,7 +1294,7 @@ class MCTEnv(gym.Env):
         return dis
 
     def to_generate_initial_slab(self):
-        slab = fcc100('Pd', size=(6, 6, 4), vacuum=10.0)
+        slab = fcc100(self.metal_ele, size=(6, 6, 4), vacuum=10.0)
         delList = [77, 83, 89, 95, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 119, 120, 125,
                    126, 131, 132, 137, 138, 139, 140, 141, 142, 143]
         del slab[[i for i in range(len(slab)) if i in delList]]
@@ -1290,7 +1312,7 @@ class MCTEnv(gym.Env):
         deepList = self.label_atoms(state, [deep_z - fluct_d_Pd, deep_z + fluct_d_Pd])
         bottomList = self.label_atoms(state, [bottom_z - fluct_d_Pd, bottom_z + fluct_d_Pd])
         envList = self.label_atoms(state, [env_z - 2.0, env_z + 2.0])
-        env_2 = self.label_atoms(state, [0.0, 19.0])
+        env_2 = self.label_atoms(state, [0.0, 9.0])
         for i in env_2:
             envList.append(i)
 
@@ -1315,7 +1337,7 @@ class MCTEnv(gym.Env):
         env_atom = env.get_positions()
 
         constraint = FixAtoms(mask=[a.symbol != 'O' and a.index in bottomList for a in slab])
-        constraint_1 = FixAtoms(mask=[a.symbol != 'Pd' and a.index in envList for a in slab])
+        constraint_1 = FixAtoms(mask=[a.symbol != self.metal_ele and a.index in envList for a in slab])
         # constraint_deepatomlist = sample(deepList, int(len(deepList)/2))
         # constraint_2 = FixAtoms(mask=[a.symbol != 'O' and a.index in constraint_deepatomlist for a in slab])
         # constraint_1.index = np.append(constraint_1.index, constraint_2.index)
@@ -1449,19 +1471,53 @@ class MCTEnv(gym.Env):
 
     def lasp_calc(self, atom):
         write_arc([atom])
-        atom.calc = LASP(task='local-opt', pot='PdO', potential='NN D3')
+        atom.calc = LASP(task='local-opt', pot=self.pot, potential='NN D3')
         energy = atom.get_potential_energy()
         force = atom.get_forces()
         atom = read_arc('allstr.arc', index = -1)
         return atom, energy, force
     
+    def nequip_calc(self, atoms, nequip_model_path):
+
+        import nequip
+        from nequip.ase import NequIPCalculator
+
+        calc = NequIPCalculator.from_deployed_model(model_path=nequip_model_path,
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"),
+            species_to_type_name = {'O': 'O', self.metal_ele: self.metal_ele},
+                )
+        
+        atoms.calc = calc
+        # dyn = LBFGS(atoms)
+        # dyn = LBFGSLineSearch(atoms)
+        dyn = QuasiNewton(atoms)
+        dyn.run(steps = 200, fmax = 0.05)
+
+        return atoms
+    
+    def mace_calc(self, atoms, mace_model_path = None):
+
+        from mace.calculators import MACECalculator
+
+        model_path = 'my_mace.model'
+
+        calculator = MACECalculator(model_paths=model_path, device='cuda')
+
+        atoms.set_calculator(calculator)
+
+        dyn = LBFGS(atoms, trajectory='lbfgs.traj')
+        dyn.run(steps = 200, fmax = 0.1)
+
+        return atoms, atoms.get_potential_energy(), atoms.get_forces()
+
+    
     def to_constraint(self, slab):
         bottomList = self.label_atoms(slab, [bottom_z - fluct_d_Pd, bottom_z + fluct_d_Pd])
         envList_1 = self.label_atoms(slab, [env_z - fluct_d_layer, env_z + fluct_d_layer])
-        envList_2 = self.label_atoms(slab, [0.0,  19.0])
+        envList_2 = self.label_atoms(slab, [0.0,  9.0])
         constraint = FixAtoms(mask=[a.symbol != 'O' and a.index in bottomList for a in slab])
-        constraint_1 = FixAtoms(mask=[a.symbol != 'Pd' and a.index in envList_1 for a in slab])
-        constraint_2 = FixAtoms(mask=[a.symbol != 'Pd' and a.index in envList_2 for a in slab])
+        constraint_1 = FixAtoms(mask=[a.symbol != self.metal_ele and a.index in envList_1 for a in slab])
+        constraint_2 = FixAtoms(mask=[a.symbol != self.metal_ele and a.index in envList_2 for a in slab])
         # constraint_deepatomlist = sample(deepList, int(len(deepList)/2))
         # constraint_3 = FixAtoms(mask=[a.symbol != 'O' and a.index in constraint_deepatomlist for a in slab])
         # constraint_2.index = np.append(constraint_3.index, constraint_2.index)
@@ -1472,9 +1528,9 @@ class MCTEnv(gym.Env):
     def exist_too_short_bonds(self,slab):
         exist = False
         ana = Analysis(slab)
-        PdPdBonds = ana.get_bonds('Pd','Pd',unique = True)
+        PdPdBonds = ana.get_bonds(self.metal_ele,self.metal_ele,unique = True)
         OOBonds = ana.get_bonds('O', 'O', unique = True)
-        PdOBonds = ana.get_bonds('Pd', 'O', unique=True)
+        PdOBonds = ana.get_bonds(self.metal_ele, 'O', unique=True)
         PdPdBondValues = ana.get_values(PdPdBonds)[0]
         minBonds = []
         minPdPd = min(PdPdBondValues)
@@ -1501,9 +1557,9 @@ class MCTEnv(gym.Env):
 
     def to_get_bond_info(self, slab):
         ana = Analysis(slab)
-        PdPdBonds = ana.get_bonds('Pd','Pd',unique = True)
+        PdPdBonds = ana.get_bonds(self.metal_ele,self.metal_ele,unique = True)
         OOBonds = ana.get_bonds('O', 'O', unique = True)
-        PdOBonds = ana.get_bonds('Pd', 'O', unique=True)
+        PdOBonds = ana.get_bonds(self.metal_ele, 'O', unique=True)
         PdPdBondValues = ana.get_values(PdPdBonds)[0]
         if OOBonds[0]:
             OOBondValues = ana.get_values(OOBonds)[0]
@@ -1533,11 +1589,18 @@ class MCTEnv(gym.Env):
     
     def ball_func(self,pos1, pos2, zeta, fi):	# zeta < 36, fi < 3
         d = distance(pos1[0],pos1[1],pos1[2],pos2[0],pos2[1],pos2[2])
-        zeta = -math.pi * zeta / 180
-        fi = -math.pi * fi / 180
+        # zeta = math.pi * zeta / 180
+        # fi = math.pi * fi / 180
         '''如果pos1[2] > pos2[2],atom_1旋转下来'''
         pos2_position = pos2
-        pos1_position = [pos2[0]+ d*sin(zeta)*cos(fi), pos2[1] + d*sin(zeta)*sin(fi),pos2[2]+d*cos(zeta)]
+
+        # pos1_position = [pos2[0] + d*sin(zeta)*cos(fi), pos2[1] +, pos2[2]]
+        pos_slr = pos1 - pos2
+
+        pos_slr_square = math.sqrt(pos_slr[0] * pos_slr[0] + pos_slr[1] * pos_slr[1])
+        pos1_position = [pos2[0] + d * pos_slr[0]/pos_slr_square, pos2[1] + d * pos_slr[1]/pos_slr_square, pos2[2]]
+
+        
         return pos1_position, pos2_position
 
     def oxy_rotation(self, slab, OO, zeta, fi):
@@ -1550,12 +1613,19 @@ class MCTEnv(gym.Env):
         return slab
     
     def to_dissociate(self, slab, atoms):
+        expanding_index = 2.0
         central_point = np.array([(slab.get_positions()[atoms[0][0]][0] + slab.get_positions()[atoms[0][1]][0])/2, 
                                   (slab.get_positions()[atoms[0][0]][1] + slab.get_positions()[atoms[0][1]][1])/2, (slab.get_positions()[atoms[0][0]][2] + slab.get_positions()[atoms[0][1]][2])/2])
-        slab.positions[atoms[0][0]] += np.array([1.15*(slab.get_positions()[atoms[0][0]][0]-central_point[0]), 
-                                                 1.15*(slab.get_positions()[atoms[0][0]][1]-central_point[1]), 1.15*(slab.get_positions()[atoms[0][0]][2]-central_point[2])])
-        slab.positions[atoms[0][1]] += np.array([1.15*(slab.get_positions()[atoms[0][1]][0]-central_point[0]), 
-                                                 1.15*(slab.get_positions()[atoms[0][1]][1]-central_point[1]), 1.15*(slab.get_positions()[atoms[0][1]][2]-central_point[2])])
+        
+        slab.positions[atoms[0][0]] += np.array([expanding_index*(slab.get_positions()[atoms[0][0]][0]-central_point[0]), 
+                                                 expanding_index*(slab.get_positions()[atoms[0][0]][1]-central_point[1]), 
+                                                 expanding_index*(slab.get_positions()[atoms[0][0]][2]-central_point[2])])
+        
+        slab.positions[atoms[0][1]] += np.array([expanding_index*(slab.get_positions()[atoms[0][1]][0]-central_point[0]), 
+                                                 expanding_index*(slab.get_positions()[atoms[0][1]][1]-central_point[1]), 
+                                                 expanding_index*(slab.get_positions()[atoms[0][1]][2]-central_point[2])])
+        
+        # print('after expanding, the positions of the atoms are', slab.get_positions()[atoms[0][0]], slab.get_positions()[atoms[0][1]])
         addable_sites = []
         layer_O = []
         layerlist = self.label_atoms(slab,[26.5,31.5])
@@ -1577,40 +1647,47 @@ class MCTEnv(gym.Env):
             if ads_site[4]:
                 addable_sites.append(ads_site)
 
-        O1_distance = []
-        for add_1_site in addable_sites:
-            distance_1 = self.distance(add_1_site[0], add_1_site[1], add_1_site[2] + 1.3, slab.get_positions()[atoms[0][0]][0],
-                                           slab.get_positions()[atoms[0][0]][1], slab.get_positions()[atoms[0][0]][2])
-            O1_distance.append(distance_1)
+        if addable_sites:
+            print("The num of addable sites is:", len(addable_sites))
+            O1_distance = []
+            for add_1_site in addable_sites:
+                distance_1 = self.distance(add_1_site[0], add_1_site[1], add_1_site[2] + 1.3, slab.get_positions()[atoms[0][0]][0],
+                                            slab.get_positions()[atoms[0][0]][1], slab.get_positions()[atoms[0][0]][2])
+                O1_distance.append(distance_1)
 
-        O1_site = addable_sites[O1_distance.index(min(O1_distance))]
-        
-        ad_2_sites = []
-        for add_site in addable_sites:
-            d = self.distance(add_site[0], add_site[1], add_site[2] + 1.3, O1_site[0], O1_site[1], O1_site[2])
-            if d > 1.0:
-                ad_2_sites.append(add_site)
+            O1_site = addable_sites[O1_distance.index(min(O1_distance))]
+            
+            ad_2_sites = []
+            for add_site in addable_sites:
+                d = self.distance(add_site[0], add_site[1], add_site[2] + 1.3, O1_site[0], O1_site[1], O1_site[2])
+                if d > 2.0 * d_O_O:
+                    ad_2_sites.append(add_site)
 
-        O2_distance = []
-        for add_2_site in ad_2_sites:
-            distance_2 = self.distance(add_2_site[0], add_2_site[1], add_2_site[2] + 1.3, slab.get_positions()[atoms[0][1]][0],
-                                        slab.get_positions()[atoms[0][1]][1], slab.get_positions()[atoms[0][1]][2])
-            O2_distance.append(distance_2)
-        
-        O2_site = ad_2_sites[O2_distance.index(min(O2_distance))]
+            O2_distance = []
+            for add_2_site in ad_2_sites:
+                distance_2 = self.distance(add_2_site[0], add_2_site[1], add_2_site[2] + 1.3, slab.get_positions()[atoms[0][1]][0],
+                                            slab.get_positions()[atoms[0][1]][1], slab.get_positions()[atoms[0][1]][2])
+                O2_distance.append(distance_2)
+            
+            O2_site = ad_2_sites[O2_distance.index(min(O2_distance))]
 
-        del slab[[i for i in range(len(slab)) if slab[i].index == atoms[0][0] or slab[i].index == atoms[0][1]]]
+            # del slab[[i for i in range(len(slab)) if slab[i].index == atoms[0][0] or slab[i].index == atoms[0][1]]]
+            for atom in slab:
+                if O1_site[0] == O2_site[0] and O1_site[1] == O2_site[1]:
+                    O_1_position = np.array([O1_site[0], O1_site[1], O1_site[2] + 1.1])
+                    O_2_position = np.array([O1_site[0], O1_site[1], O1_site[2] + 2.31])
+                else:
+                    O_1_position = np.array([O1_site[0], O1_site[1], O1_site[2] + 1.1])
+                    O_2_position = np.array([O2_site[0], O2_site[1], O2_site[2] + 1.1])
 
-        if O1_site[0] == O2_site[0] and O1_site[1] == O2_site[1]:
-            O_1 = Atom('O', (O1_site[0], O1_site[1], O1_site[2] + 1.3))
-            O_2 = Atom('O', (O1_site[0], O1_site[1], O1_site[2] + 2.51))
-        else:
+                if atom.index == atoms[0][0]:
+                        atom.position = O_1_position
+                elif atom.index == atoms[0][1]:
+                    atom.position = O_2_position
+            
+            print('O1 position is:', O_1_position)
+            print('O2 position is:', O_2_position)
 
-            O_1 = Atom('O', (O1_site[0], O1_site[1], O1_site[2] + 1.3))
-            O_2 = Atom('O', (O2_site[0], O2_site[1], O2_site[2] + 1.3))
-
-        slab = slab + O_1
-        slab = slab + O_2
         return slab
     
     def get_angle_with_z(self,slab, atoms):
@@ -1678,8 +1755,9 @@ class MCTEnv(gym.Env):
     def to_ads_adsorbate(self, slab):
         ads = ()
         ana = Analysis(slab)
+        O3_list = []
         OOBonds = ana.get_bonds('O', 'O', unique = True)
-        PdOBonds = ana.get_bonds('Pd', 'O', unique=True)
+        PdOBonds = ana.get_bonds(self.metal_ele, 'O', unique=True)
 
         OOOangles = ana.get_angles('O', 'O', 'O',unique = True)
 
@@ -1689,16 +1767,20 @@ class MCTEnv(gym.Env):
             for i in PdOBonds[0]:
                 Pd_O_list.append(i[0])
                 Pd_O_list.append(i[1])
-        
-        if OOBonds[0]:  # 定义环境中的氧气分子
-            for i in OOBonds[0]:
-                if i[0] not in Pd_O_list and i[1] not in Pd_O_list:
-                    ads_list.append(i)
 
         if OOOangles[0]:
             for j in OOOangles[0]:
                 if j[0] not in Pd_O_list and j[1] not in Pd_O_list and j[2] not in Pd_O_list:
                     ads_list.append(j)
+                    O3_list.append(j[0])
+                    O3_list.append(j[1])
+                    O3_list.append(j[2])
+
+
+        if OOBonds[0]:  # 定义环境中的氧气分子
+            for i in OOBonds[0]:
+                if (i[0] not in Pd_O_list and i[0] not in O3_list) and (i[1] not in Pd_O_list and i[1] not in O3_list):
+                    ads_list.append(i)
 
         if ads_list:
             ads = ads_list[np.random.randint(len(ads_list))]
@@ -1708,7 +1790,7 @@ class MCTEnv(gym.Env):
         desorb = ()
         ana = Analysis(slab)
         OOBonds = ana.get_bonds('O', 'O', unique = True)
-        PdOBonds = ana.get_bonds('Pd', 'O', unique=True)
+        PdOBonds = ana.get_bonds(self.metal_ele, 'O', unique=True)
 
         OOOangles = ana.get_angles('O', 'O', 'O',unique = True)
 
@@ -1736,6 +1818,10 @@ class MCTEnv(gym.Env):
     def _2D_distance(self, x1,x2, y1,y2):
         dis = math.sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2))
         return dis
+    
+    def get_surf_atoms(self,atoms):
+        surfList = self.label_atoms(atoms, [surf_z - fluct_d_Pd, surf_z + fluct_d_Pd])
+        return surfList
 
     def layer_O_atom_list(self, slab):
         layer_O = []
@@ -1752,7 +1838,7 @@ class MCTEnv(gym.Env):
             OObonds = ana.get_bonds('O','O',unique = True)
             if OObonds[0]:
                 for i in OObonds[0]:
-                    if i[0] in layer_O and i[1] in layer_O:
+                    if i[0] in layer_O or i[1] in layer_O:
                         layer_OObond_list.append(i[0])
                         layer_OObond_list.append(i[1])
 
@@ -1785,6 +1871,32 @@ class MCTEnv(gym.Env):
                     sub_O_atom_list.append(j)
         return sub_O_atom_list
 
+    def _get_observation_info(self, atoms):
+        info_list = atoms.get_positions()
+
+        for i in range(len(atoms.get_positions())):
+            info_list[i] = np.append(info_list[i], Eledict[atoms[i].symbol])
+        
+        return info_list
+    
+    def _use_Painn_description(self, atoms):
+        input_dict = Painn.atoms_to_graph_dict(atoms, self.cutoff)
+        atom_model = Painn.PainnDensityModel(
+            num_interactions = self.num_interactions,
+            hidden_state_size = self.hidden_state_size,
+            cutoff = self.cutoff,
+            atoms = atoms,
+            embedding_size = self.embedding_size,
+        )
+
+        torch.set_default_dtype(torch.float32)
+        atom_representation_scalar, atom_representation_vector = atom_model(input_dict)
+
+        # atom_representation_scalar = torch.tensor(atom_representation_scalar, dtype = torch.float32)
+        # atom_representation_vector = torch.tensor(atom_representation_vector, dtype = torch.float32)
+
+        return [np.array(atom_representation_scalar[0].tolist()), np.array(atom_representation_vector[0].tolist())]
+
 def label_atoms(atoms, zRange):
     myPos = atoms.get_positions()
     return [
@@ -1795,19 +1907,19 @@ def label_atoms(atoms, zRange):
 
 fluct_d_Pd = 1.0
 fluct_d_layer = 3.0
-env_z = 46.335
-layer_z = 29.0
+env_z = 25.835
+layer_z = 19.0
 layerList = label_atoms(slab, [layer_z - fluct_d_layer, layer_z + fluct_d_layer])
-surf_z = 26.0
+surf_z = 16.0
 surfList = label_atoms(slab, [surf_z - fluct_d_Pd, surf_z + fluct_d_Pd * 2])
 for i in surfList:
 	if slab[i].symbol == 'O':
 		surfList.remove(i)
-sub_z = 24.0
+sub_z = 14.0
 subList = label_atoms(slab, [sub_z - fluct_d_Pd, sub_z + fluct_d_Pd])
-deep_z = 22.0
+deep_z = 12.0
 deepList = label_atoms(slab, [deep_z - fluct_d_Pd, deep_z + fluct_d_Pd])
-bottom_z = 20.0
+bottom_z = 10.0
 bottomList = label_atoms(slab, [bottom_z - fluct_d_Pd, bottom_z + fluct_d_Pd])
 
 layer = slab.copy()
@@ -1831,9 +1943,9 @@ deep_atom = deep_layer.get_positions()
 molecule = Atoms("OO", positions=[[0, 0, 0], [0, 0, 1.21]], pbc=True)
 
 for i in atop:
-    add_adsorbate(slab, molecule, 22.395 - 45.835, position=(i[0] + 0.5, i[1] + 0.5))
-    add_adsorbate(slab, molecule, 27.895 - 45.835, position=(i[0] + 0.5, i[1] + 0.5))
-    add_adsorbate(slab, molecule, 32.395 - 45.835, position=(i[0] + 0.5, i[1] + 0.5))
+    add_adsorbate(slab, molecule, 11.395 - 25.835, position=(i[0] + 0.5, i[1] + 0.5))
+    add_adsorbate(slab, molecule, 15.895 - 25.835, position=(i[0] + 0.5, i[1] + 0.5))
+    # add_adsorbate(slab, molecule, 32.395 - 45.835, position=(i[0] + 0.5, i[1] + 0.5))
 envList = label_atoms(slab, [2.0- fluct_d_layer, 6.0 + fluct_d_layer])
 env = slab.copy()
 del env[[i for i in range(len(env)) if i not in envList]]
@@ -1893,6 +2005,22 @@ for i in sites_1:
 
 surf_sites = np.array(surf_sites)
 
+Eledict  = { 'H':1,     'He':2,   'Li':3,    'Be':4,   'B':5,     'C':6,     'N':7,     'O':8,
+            'F':9,     'Ne':10,  'Na':11,   'Mg':12,  'Al':13,   'Si':14,   'P':15,    'S':16,
+		'Cl':17,   'Ar':18,  'K':19,    'Ca':20,  'Sc':21,   'Ti':22,   'V':23,    'Cr':24,
+		'Mn':25,   'Fe':26,  'Co':27,   'Ni':28,  'Cu':29,   'Zn':30,   'Ga':31,   'Ge':32,
+		'As':33,   'Se':34,  'Br':35,   'Kr':36,  'Rb':37,   'Sr':38,   'Y':39,    'Zr':40,
+		'Nb':41,   'Mo':42,  'Tc':43,   'Ru':44,  'Rh':45,   'Pd':46,   'Ag':47,   'Cd':48,
+		'In':49,   'Sn':50,  'Sb':51,   'Te':52,  'I':53,    'Xe':54,   'Cs':55,   'Ba':56,
+		'La':57,   'Ce':58,  'Pr':59,   'Nd':60,  'Pm':61,   'Sm':62,   'Eu':63,   'Gd':64, 
+		'Tb':65,   'Dy':66,  'Ho':67,   'Er':68,  'Tm':69,   'Yb':70,   'Lu':71,   'Hf':72, 
+		'Ta':73,   'W':74,   'Re':75,   'Os':76,  'Ir':77,   'Pt':78,   'Au':79,   'Hg':80, 
+		'Tl':81,   'Pb':82,  'Bi':83,   'Po':84,  'At':85,   'Rn':86,   'Fr':87,   'Ra':88, 
+		'Ac':89,   'Th':90,  'Pa':91,   'U':92,   'Np':93,   'Pu':94,   'Am':95,   'Cm':96, 
+		'Bk':97,   'Cf':98,  'Es':99,   'Fm':100, 'Md':101,  'No':102,  'Lr':103,  'Rf':104, 
+		'Db':105,  'Sg':106, 'Bh':107,  'Hs':108, 'Mt':109,  'Ds':110,  'Rg':111,  'Cn':112, 
+		'Nh':113, 'Fl':114, 'Mc':115, 'Lv':116, 'Ts':117, 'Og':118} 
+
 Eleradii = [0.32, 0.46, 1.33, 1.02, 0.85, 0.75, 0.71, 0.63, 0.64, 0.67, 1.55, 1.39,
             1.26, 1.16, 1.11, 1.03, 0.99, 0.96, 1.96, 1.71, 1.48, 1.36, 1.34, 1.22,
             1.19, 1.16, 1.11, 1.10, 1.12, 1.18, 1.24, 1.21, 1.21, 1.16, 1.14, 1.17,
@@ -1906,6 +2034,7 @@ Eleradii = [0.32, 0.46, 1.33, 1.02, 0.85, 0.75, 0.71, 0.63, 0.64, 0.67, 1.55, 1.
 
 r_O = Eleradii[7]
 r_Pd = Eleradii[45]
+r_surf_Pd = 2.753/2
 
 d_O_Pd = r_O + r_Pd
 d_O_O = 2 * r_O
