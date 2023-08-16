@@ -84,6 +84,7 @@ DIRECTION = [
 ]
 # 设定动作空间
 ACTION_SPACES = ['ADS', 'Translation', 'R_Rotation', 'L_Rotation', 'MD', 'Diffusion', 'Drill', 'Dissociation', 'Desportion']
+# ACTION_SPACES = ['ADS', 'Translation', 'R_Rotation', 'L_Rotation', 'Diffusion', 'Drill', 'Dissociation', 'Desportion']
 # TODO:
 '''
     3.add "LAT_TRANS" part into step(considered in the cluster situation)
@@ -131,7 +132,7 @@ class MCTEnv(gym.Env):
         self.E_OOP = self.add_mole(self.initial_state, 'OOO', 1.28)
         
         self.total_surfaces = self.initial_state.get_surfaces()
-        self.facet_sites_dict = {'facets': self.total_surfaces, 'sites': []}
+        # self.facet_sites_dict = {'facets': self.total_surfaces, 'sites': []}
         
         self.to_constraint(self.initial_state)
         self.initial_state, self.energy, self.force = self.lasp_calc(self.initial_state)  # 由于使用lasp计算，设定初始能量
@@ -236,14 +237,19 @@ class MCTEnv(gym.Env):
 
         self.atoms, previous_structure, previous_energy = self.state
 
+        surflist = self.get_surf_atoms(self.atoms)
+        print(f'current surflist is : {surflist}')
+
         atoms = self.atoms.copy()
         self.surfList = []
         # for facet in atoms.get_surfaces():
-        for facet in self.facet_sites_dict['facets']:
-            atoms= self.cluster_rotation(atoms, facet)
+        for facet in self.total_surfaces:
+            atoms= self.cluster_rotation(atoms, facet)  
             list = self.get_surf_atoms(atoms)
             for i in list:
                 self.surfList.append(i)
+            # surf_sites = self.get_surf_sites(atoms)
+            # self.facet_sites_dict['sites'].append(surf_sites)
             atoms = self.recover_rotation(atoms, facet)
 
         self.surfList = [i for n, i in enumerate(self.surfList) if i not in self.surfList[:n]]
@@ -261,9 +267,9 @@ class MCTEnv(gym.Env):
             type(self.action_idx),
         )
         
-        if action in [0, 5, 6, 7]:
+        if action in [0, 1, 2, 3, 5, 6, 7]:
             # self.facet_selection = action['facet_selection']
-            self.facet_selection = self.facet_sites_dict['facets'][np.random.randint(len(self.facet_sites_dict['facets']))]
+            self.facet_selection = self.total_surfaces[np.random.randint(len(self.total_surfaces))]
             self.cluster_rotation(self.atoms, self.facet_selection)
 
         self.muti_movement = np.array([np.random.normal(0.25,0.25), np.random.normal(0.25,0.25), np.random.normal(0.25,0.25)])
@@ -328,7 +334,6 @@ class MCTEnv(gym.Env):
             dyn = Langevin(self.atoms, 5 * units.fs, self.temperature_K * units.kB, 0.002, trajectory=save_path_md,
                            logfile='MD.log')
             dyn.run(self.steps)
-
             '''------------The above actions are muti-actions and the following actions contain single-atom actions--------------------------------'''
 
         elif self.action_idx == 5:  # 表面上氧原子的扩散，单原子行为
@@ -348,9 +353,9 @@ class MCTEnv(gym.Env):
 
         self.timestep += 1
 
-        print(f'action = {self.action_idx}, selected_facet = {self.facet_selection}')
+        # print(f'action = {self.action_idx}, selected_facet = {self.facet_selection}')
         
-        if action in [0, 5, 6, 7]:
+        if action in [0, 1, 2, 3, 5, 6, 7]:
             self.recover_rotation(self.atoms, self.facet_selection)
 
         previous_atom = self.trajectories[-1]
@@ -538,11 +543,14 @@ class MCTEnv(gym.Env):
         actions = np.array(self.history['actions'])
 
         plt.figure(figsize=(30, 30))
-        plt.xticks(fontsize=12, fontfamily='Arial', fontweight='bold')
+        '''plt.xticks(fontsize=12, fontfamily='Arial', fontweight='bold')
         plt.yticks(fontsize=12, fontfamily='Arial', fontweight='bold')
         # plt.title('Epi_{}'.format(620 + episode), fontsize=28, fontweight='bold', fontfamily='Arial')
         plt.xlabel('steps(fs)', fontsize=18, fontweight='bold', fontstyle='italic', fontfamily='Arial')
         plt.ylabel('Energies(eV)', fontsize=18, fontweight='bold', fontstyle='italic', fontfamily='Arial')
+        plt.plot(energies, color='blue')'''
+        plt.xlabel('steps')
+        plt.ylabel('Energies')
         plt.plot(energies, color='blue')
 
         for action_index in range(len(ACTION_SPACES)):
@@ -816,6 +824,15 @@ class MCTEnv(gym.Env):
         self.TS['timesteps'].append(self.history['timesteps'][-1] + 1)
         return
 
+    def get_ads_d(self, ads_site):
+        if ads_site[3] == 1:
+            d = 1.5
+        elif ads_site[3] == 2:
+            d = 1.3
+        else:
+            d = 1.0
+        return d
+    
     def choose_ads_site(self, state):
         new_state = state.copy()
         layerList = self.get_layer_atoms(new_state)
@@ -828,7 +845,7 @@ class MCTEnv(gym.Env):
         else:
             new_state = self.recover_rotation(new_state, self.facet_selection)
             addable_facet_list = []
-            for facet in self.facet_sites_dict['facets']:
+            for facet in self.total_surfaces:
                 new_state = self.cluster_rotation(new_state, facet)
                 list = self.get_surf_atoms(new_state)
                 if len(list) > 3:
@@ -870,16 +887,17 @@ class MCTEnv(gym.Env):
             if ads:
                 if ads == 2:
                     self.n_O2 -= 1
-                    O1 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + 1.3))
-                    O2 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + 2.51))
+                    d = self.get_ads_d(ads_site)
+                    O1 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + d))
+                    O2 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + d + 1.21))
                     new_state = new_state + O1
                     new_state = new_state + O2
                     # ads = O1 + O2
                 elif ads == 3:
                     self.n_O3 -= 1
-                    O1 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + 1.3))
-                    O2 = Atom('O', (ads_site[0], ads_site[1] + 1.09, ads_site[2] + 1.97))
-                    O3 = Atom('O', (ads_site[0], ads_site[1] - 1.09, ads_site[2] + 1.97))
+                    O1 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + d))
+                    O2 = Atom('O', (ads_site[0], ads_site[1] + 1.09, ads_site[2] + d + 0.67))
+                    O3 = Atom('O', (ads_site[0], ads_site[1] - 1.09, ads_site[2] + d + 0.67))
                     new_state = new_state + O1
                     new_state = new_state + O2
                     new_state = new_state + O3
@@ -990,10 +1008,12 @@ class MCTEnv(gym.Env):
 
             single_layer_O = self.layer_O_atom_list(slab)
 
+            print(f'The initial facet selection is {self.facet_selection}')
+
             if not single_layer_O:
                 slab = self.recover_rotation(slab, selected_facet)
                 diffusable_facet_list = []
-                for facet in self.facet_sites_dict['facets']:
+                for facet in self.total_surfaces:
                     slab = self.cluster_rotation(slab, facet)
 
                     single_layer_O_tmp = self.layer_O_atom_list(slab)
@@ -1009,28 +1029,43 @@ class MCTEnv(gym.Env):
 
                 slab = self.cluster_rotation(slab, self.facet_selection)
                 # surf_sites = self.get_surf_sites(new_state)
-
+            
+            print(f'The current_facet_selection is {self.facet_selection}')
             neigh_facets = self.neighbour_facet(slab, self.facet_selection)
+
+            # inspected_surf_list = self.get_surf_atoms(slab)
+            # print(f'The surf list before neigh facets selection is : {inspected_surf_list}, and the selected facet is : {self.facet_selection}, action done = {action_done}')
+            # print(len(neigh_facets))
+            # now the facet has been recovered
+            neigh_sites_list = []
             for neigh_facet in neigh_facets:
                 slab = self.cluster_rotation(slab, neigh_facet)
                 neigh_surf_list = self.get_surf_atoms(slab)
                 if len(neigh_surf_list) > 3:
                     sites = self.get_surf_sites(slab)
+                    neigh_sites_list.append(sites)
                     for site in sites:
                         diffuse_sites.append(site.tolist())
                 slab = self.recover_rotation(slab, neigh_facet)
             diffuse_sites = np.array(diffuse_sites)
+
+            # after_neigh_surf_list = self.get_surf_atoms(slab)
+            # print(f'The surf list after neigh facets selection is : {after_neigh_surf_list}, and the selected facet is : {self.facet_selection}, action done = {action_done}')
+            # print(len(neigh_sites_list))
+            # now the facet has been recovered
 
             diffusable_sites = []
             interference_O_distance = []
             diffusable = True
 
             c_layer_List = self.get_layer_atoms(slab)
+            print(f'current layer list: {c_layer_List}')
             c_layer_O = []
             for i in slab:
                 if i.index in c_layer_List and i.symbol == 'O':
                     c_layer_O.append(i.index)
 
+            print(f'current layer O list: {c_layer_O}')
             single_layer_O_c = self.layer_O_atom_list(slab)
             
             for ads_sites in diffuse_sites:    # 寻找可以diffuse的位点
@@ -1066,16 +1101,32 @@ class MCTEnv(gym.Env):
                     else:
                         to_diffuse_O_list.append(i)
 
+            print(f'to_diffuse_O_list:{to_diffuse_O_list}, single_layer_O_list:{single_layer_O_c}, diffusable_sites:{bool(diffusable_sites)}')
+
             if to_diffuse_O_list and diffusable_sites:
                 selected_O_index = to_diffuse_O_list[np.random.randint(len(to_diffuse_O_list))]
                 diffuse_site = diffusable_sites[np.random.randint(len(diffusable_sites))]
 
-                '''# target_facet_list is to help the atom to add better and more reasonable
+                for n in range(len(neigh_facets)):
+                    # print(f'neigh_sites_list[n]: {neigh_sites_list[n].size}')
+                    # if neigh_sites_list[n] in dir():
+                    if neigh_sites_list[n].size != 0:
+                        if diffuse_site in neigh_sites_list[n]:
+                            self.facet_selection = neigh_facets[n]
+
+                # print(self.facet_selection)
+                slab = self.cluster_rotation(slab, self.facet_selection)
+
+                this_surf_list = self.get_surf_atoms(slab)
+                # print(f'The surf list in Line 1112 : {this_surf_list}, and the selected facet is : {self.facet_selection}, action done = {action_done}')
+
+
+                ''' # target_facet_list is to help the atom to add better and more reasonable
                 target_facet_list = []
                 for i in len(self.facet_sites_dict['sites']):
                     facet_sites = self.facet_sites_dict['sites'][i]
                     if diffuse_site in facet_sites:
-                        target_facet_list.append(self.facet_sites_dict['facets'][i])'''
+                        target_facet_list.append(self.total_surfaces[i])'''
 
                 interference_O_list = [i for i in c_layer_O if i != selected_O_index]
 
@@ -1090,17 +1141,19 @@ class MCTEnv(gym.Env):
                 if diffusable:
                     for atom in slab:
                         if atom.index == selected_O_index:
-                            atom.position = np.array([diffuse_site[0], diffuse_site[1], diffuse_site[2] + 1.5])
+                            d = self.get_ads_d(diffuse_site)
+                            atom.position = np.array([diffuse_site[0], diffuse_site[1], diffuse_site[2] + d])
                     # del slab[[j for j in range(len(slab)) if j == selected_O_index]]
                     # O = Atom('O', (diffuse_site[0], diffuse_site[1], diffuse_site[2] + 1.5))
                     # slab = slab + O
                 else:
                     action_done = False
             else:
+                slab = self.cluster_rotation(slab, self.facet_selection)
                 action_done = False
         else:
             action_done = False
-            
+        
         return slab, action_done
 
     def to_expand_lattice(self, slab, expand_layer, expand_surf, expand_lattice):
@@ -1167,7 +1220,7 @@ class MCTEnv(gym.Env):
             if not selected_drill_O_list:
                 slab = self.recover_rotation(slab, self.facet_selection)
                 drillable_facet_list = []
-                for facet in self.facet_sites_dict['facets']:
+                for facet in self.total_surfaces:
                     slab = self.cluster_rotation(slab, facet)
                     layer_O_atom_list_p = self.layer_O_atom_list(slab)
                     sub_O_atom_list_p = self.sub_O_atom_list(slab)
@@ -1205,7 +1258,7 @@ class MCTEnv(gym.Env):
                 selected_O = c_selected_drill_O_list[np.random.randint(len(c_selected_drill_O_list))]
 
                 # slab = self.to_expand_lattice(slab, 1.25, 1.25, 1.1)
-                print(f'selected O atom is : {selected_O}')
+                # print(f'selected O atom is : {selected_O}')
                 
                 if selected_O in c_layer_O_atom_list:
                     slab, action_done = self.to_drill_surf(slab, selected_O)
@@ -1266,7 +1319,7 @@ class MCTEnv(gym.Env):
             
             for atom in slab:
                 if atom.index == selected_drill_atom:
-                    atom.position = np.array([drill_site[0], drill_site[1], drill_site[2] +1.3])
+                    atom.position = np.array([drill_site[0], drill_site[1], drill_site[2] +1.0])
 
             lifted_atoms_list = []
             current_surfList = self.get_surf_atoms(slab)
@@ -1279,7 +1332,7 @@ class MCTEnv(gym.Env):
                 lifted_atoms_list.append(surf_atom)
 
             for lifted_atom in lifted_atoms_list:
-                slab.positions[lifted_atom][2] += 0.8
+                slab.positions[lifted_atom][2] += 0.5
         else:
             action_done = False
         return slab, action_done
@@ -1317,7 +1370,7 @@ class MCTEnv(gym.Env):
             drill_site = deep_sites[to_distance.index(min(to_distance))]
             for atom in slab:
                 if atom.index == selected_drill_atom:
-                    atom.position = np.array([drill_site[0], drill_site[1], drill_site[2] +1.3])
+                    atom.position = np.array([drill_site[0], drill_site[1], drill_site[2] +1.0])
 
             lifted_atoms_list = []
             current_surfList = self.get_surf_atoms(slab)
@@ -1334,7 +1387,7 @@ class MCTEnv(gym.Env):
                 lifted_atoms_list.append(layer_atom)
 
             for lifted_atom in lifted_atoms_list:
-                slab.positions[lifted_atom][2] += 0.8
+                slab.positions[lifted_atom][2] += 0.5
 
         else:
             action_done = False
@@ -1348,7 +1401,7 @@ class MCTEnv(gym.Env):
         if not dissociate_O2_list:
             slab = self.recover_rotation(slab, self.facet_selection)
             dissociable_facet_list = []
-            for facet in self.facet_sites_dict['facets']:
+            for facet in self.total_surfaces:
                 slab = self.cluster_rotation(slab, facet)
                 dissociate_O2_list_tmp = self.get_dissociate_O2_list(slab)
 
@@ -1482,29 +1535,31 @@ class MCTEnv(gym.Env):
     def get_total_surf_sites(self,atoms):
         total_surf_sites = []
 
-        for facet in self.facet_sites_dict['facets']:
+        for facet in self.total_surfaces:
             self.cluster_rotation(atoms, facet)
             total_surf_sites.append(self.get_surf_sites(atoms))
             self.recover_rotation(atoms, facet)
-        self.facet_sites_dict['sites'] = total_surf_sites
+        # self.facet_sites_dict['sites'] = total_surf_sites
 
         return total_surf_sites
 
     def get_total_sub_sites(self,atoms):
         total_sub_sites = []
         
-        for facet in self.facet_sites_dict['facets']:
+        for facet in self.total_surfaces:
             self.cluster_rotation(atoms, facet)
             total_sub_sites.append(self.get_sub_sites(atoms))
             self.recover_rotation(atoms, facet)
         
         return total_sub_sites
     
+    
     def get_surf_sites(self, atoms):
         surfList = self.get_surf_atoms(atoms)
 
         surf = atoms.copy()
-        del surf[[i for i in range(len(surf)) if i not in surfList]]
+        del surf[[i for i in range(len(surf)) if (i not in surfList) or surf[i].symbol != self.metal_ele]]
+        
 
         surf_sites = self.get_sites(surf)
 
@@ -1514,7 +1569,7 @@ class MCTEnv(gym.Env):
         subList = self.get_sub_atoms(atoms)
 
         sub = atoms.copy()
-        del sub[[i for i in range(len(sub)) if i not in subList]]
+        del sub[[i for i in range(len(sub)) if (i not in subList) or sub[i].symbol != self.metal_ele]]
 
         sub_sites = self.get_sites(sub)
         return sub_sites
@@ -1523,7 +1578,7 @@ class MCTEnv(gym.Env):
         deepList = self.get_deep_atoms(atoms)
 
         deep = atoms.copy()
-        del deep[[i for i in range(len(deep)) if i not in deepList]]
+        del deep[[i for i in range(len(deep)) if (i not in deepList) or deep[i].symbol != self.metal_ele]]
 
         deep_sites = self.get_sites(deep)
 
@@ -1733,8 +1788,8 @@ class MCTEnv(gym.Env):
         if len(surfList) > 3:
             surf_sites = self.get_surf_sites(new_state)
         else:
-            new_state = self.recover_rotation(new_state, self.facet_selection)
             neigh_facets = self.neighbour_facet(slab, self.facet_selection)
+            # now the facet has been recovered
             to_dissociate_facet_list = []
             for facet in neigh_facets:
                 new_state = self.cluster_rotation(new_state, facet)
@@ -1743,6 +1798,7 @@ class MCTEnv(gym.Env):
                 if len(neigh_surf_list) > 3:
                     to_dissociate_facet_list.append(facet)
                 new_state = self.recover_rotation(new_state, facet)
+                
             to_dissociate_facet = to_dissociate_facet_list[np.random.randint(len(to_dissociate_facet_list))]
             new_state = self.cluster_rotation(new_state, to_dissociate_facet)
             surf_sites = self.get_surf_sites(new_state)
@@ -1785,16 +1841,19 @@ class MCTEnv(gym.Env):
             O2_distance.append(distance_2)
         
         O2_site = ad_2_sites[O2_distance.index(min(O2_distance))]
+        d_1 = self.get_ads_d(O1_site)
+        d_2 = self.get_ads_d(O2_site)
 
         # print(f'site_1 = {O1_site}, site_2 = {O2_site}')
         for atom in slab:
             if O1_site[0] == O2_site[0] and O1_site[1] == O2_site[1]:
-                O_1_position = np.array([O1_site[0], O1_site[1], O1_site[2] + 1.3])
-                O_2_position = np.array([O1_site[0], O1_site[1], O1_site[2] + 2.51])
+                
+                O_1_position = np.array([O1_site[0], O1_site[1], O1_site[2] + d_1])
+                O_2_position = np.array([O1_site[0], O1_site[1], O1_site[2] + d_1 + 1.21])
                 action_done = False
             else:
-                O_1_position = np.array([O1_site[0], O1_site[1], O1_site[2] + 1.3])
-                O_2_position = np.array([O2_site[0], O2_site[1], O2_site[2] + 1.3])
+                O_1_position = np.array([O1_site[0], O1_site[1], O1_site[2] + d_1])
+                O_2_position = np.array([O2_site[0], O2_site[1], O2_site[2] + d_2])
 
             if atom.index == atoms[0][0]:
                 atom.position = O_1_position
@@ -2098,7 +2157,18 @@ class MCTEnv(gym.Env):
 
         layerlist = self.label_atoms(atoms, [z_max - 1.0, z_max + 6.0])
 
-        return layerlist
+        sum_z = 0
+        if layerlist:
+            for i in layerlist:
+                sum_z += atoms.get_positions()[i][2]
+
+            modified_z = sum_z / len(layerlist)
+            modified_layer_list = self.label_atoms(atoms, [modified_z - 1.0, modified_z + 1.0])
+        else:
+            modified_layer_list = layerlist
+        
+
+        return modified_layer_list
     
     def modify_slab_layer_atoms(self, atoms, list):
         sum_z = 0
@@ -2157,13 +2227,14 @@ class MCTEnv(gym.Env):
         return modified_deeplist
 
     def neighbour_facet(self, atoms, facet):
-        atoms= self.cluster_rotation(atoms, facet)
+        # atoms = self.recover_rotation(atoms, facet)
+        # atoms= self.cluster_rotation(atoms, facet)
         surface_list = self.get_surf_atoms(atoms)
         atoms = self.recover_rotation(atoms, facet)
         neighbour_facet = []
         neighbour_facet.append(facet)
         # for selected_facet in atoms.get_surfaces():
-        for selected_facet in self.facet_sites_dict['facets']:
+        for selected_facet in self.total_surfaces:
             if selected_facet[0] != facet[0] or selected_facet[1] != facet[1] or selected_facet[2] != facet[2]:
                 atoms = self.cluster_rotation(atoms, selected_facet)
                 selected_surface_list = self.get_surf_atoms(atoms)
@@ -2176,7 +2247,7 @@ class MCTEnv(gym.Env):
     def get_constraint(self, atoms):
         surfList = []
         # for facet in atoms.get_surfaces():
-        for facet in self.facet_sites_dict['facets']:
+        for facet in self.total_surfaces:
             atoms= self.cluster_rotation(atoms, facet)
             list = self.get_surf_atoms(atoms)
             for i in list:
@@ -2288,7 +2359,7 @@ class MCTEnv(gym.Env):
             if atom.symbol == 'O':
                 total_O_list.append(atom.index)
 
-        for facet in self.facet_sites_dict['facets']:
+        for facet in self.total_surfaces:
             slab= self.cluster_rotation(slab, facet)
             layer_list = self.get_layer_atoms(slab)
             sub_list = self.get_sub_atoms(slab)
