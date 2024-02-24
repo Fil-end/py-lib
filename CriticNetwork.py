@@ -18,6 +18,7 @@ class ValueNet(torch.nn.Module):
     # simple linear network
     def __init__(self, state_dim, hidden_dim):
         super(ValueNet, self).__init__()
+        # self.embedding = nn.Embedding(state_dim, 50)
         self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
         self.fc2 = torch.nn.Linear(hidden_dim, 1)
 
@@ -25,9 +26,14 @@ class ValueNet(torch.nn.Module):
         orthogonal_init(self.fc1)
         orthogonal_init(self.fc2, gain=0.01)
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
+    def forward(self, mlp_input):
+        if len(mlp_input.shape) == 3:
+            x1 = rearrange(mlp_input, 'a b c ->c (a b)')   # state_dim, 3, embedding_size -> embedding_size, 3, state_dim
+        else:
+            x1 = rearrange(mlp_input, 'l a b c ->l c (a b)')   # state_dim, 3, embedding_size -> embedding_size, 3, state_dim
+        x2 = F.relu(self.fc1(x1))
+
+        return torch.mean(self.fc2(x2), dim=1)
 
 
 class PaiNNValueNet(nn.Module):

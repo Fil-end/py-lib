@@ -1,3 +1,4 @@
+from re import X
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ class PolicyNet(torch.nn.Module):
     # simple linear network
     def __init__(self, state_dim, hidden_dim, action_dim):
         super(PolicyNet, self).__init__()
+        # self.atom_embeddings = nn.Embedding(min(118,max(state_dim, 50)),50)
         self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
         self.fc2 = torch.nn.Linear(hidden_dim, action_dim)
 
@@ -25,9 +27,15 @@ class PolicyNet(torch.nn.Module):
         orthogonal_init(self.fc1)
         orthogonal_init(self.fc2, gain=0.01)
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        return F.softmax(self.fc2(x), dim=1)
+    def forward(self, mlp_input):
+        if len(mlp_input.shape) == 3:
+            x1 = rearrange(mlp_input, 'a b c ->c (a b)')   # state_dim, 3, embedding_size -> embedding_size, 3, state_dim
+            x2 = F.relu(self.fc1(x1))
+            return torch.mean(F.softmax(self.fc2(x2), dim=1),dim = 0)
+        else:
+            x1 = rearrange(mlp_input, 'l a b c ->l c (a b)')
+            x2 = F.relu(self.fc1(x1))
+            return torch.mean(F.softmax(self.fc2(x2), dim=2),dim = 1)
     
 
 class PaiNNPolicyNet(nn.Module):
