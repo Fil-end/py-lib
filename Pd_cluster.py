@@ -2,6 +2,7 @@
 # The function of the code is to offer a simulation environment
 # for the deep reinforcement learning(PPO).
 import sys
+from typing import List
 
 import numpy as np
 import matplotlib
@@ -187,7 +188,6 @@ class MCTEnv(gym.Env):
         self.adsorb_history = {}
 
         # 标记可以自由移动的原子
-        # self.free_atoms = atoms.constraints[0].get_indices()
         self.fix_atoms = self.get_constraint(atoms).get_indices()
         self.free_atoms = list(set(range(len(self.initial_state))) - set(self.fix_atoms))
         self.len_atom = len(self.initial_state) - len(self.fix_atoms)
@@ -200,11 +200,6 @@ class MCTEnv(gym.Env):
         self.thermal_energy = k * temperature * self.len_atom
 
         self.action_space = spaces.Discrete(len(ACTION_SPACES))
-        # 'facet_selection': spaces.Discrete(len(atoms.get_surfaces()))
-        # self.total_surfaces = atoms.get_surfaces()
-
-        # 设定动作空间，‘action_type’为action_space中的独立动作,atom_selection为三层Pd layer和环境中的16个氧
-        # movement设定为单个原子在空间中的运动（x,y,z）
         # 定义动作空间
         self.use_GNN_description = use_GNN_description
         self.observation_space = self.get_observation_space()
@@ -215,12 +210,10 @@ class MCTEnv(gym.Env):
         return
 
     def step(self, action):
-        pro = 1  # 定义该step完成该动作的概率，初始化为1
         barrier = 0
         self.steps = 50  # 定义优化的最大步长
         reward = 0  # 定义初始奖励为0
 
-        diffusable = 1
         # self.action_idx = action['action_type']
         self.action_idx = action
         
@@ -255,13 +248,6 @@ class MCTEnv(gym.Env):
         self.surfList = [i for n, i in enumerate(self.surfList) if i not in self.surfList[:n]]
         constraint = FixAtoms(mask=[a.symbol != 'O' and a.index not in self.surfList for a in atoms])
 
-
-        # 定义表层、次表层、深层以及环境层的平动范围
-        # self.lamada_d = 0.2
-        # self.lamada_s = 0.4
-        # self.lamada_layer = 0.6
-        # self.lamada_env = 0
-
         assert self.action_space.contains(self.action_idx), "%r (%s) invalid" % (
             self.action_idx,
             type(self.action_idx),
@@ -271,9 +257,6 @@ class MCTEnv(gym.Env):
             # self.facet_selection = action['facet_selection']
             self.facet_selection = self.total_surfaces[np.random.randint(len(self.total_surfaces))]
             self.cluster_rotation(self.atoms, self.facet_selection)
-
-        # self.muti_movement = np.array([np.random.normal(0.25,0.25), np.random.normal(0.25,0.25), np.random.normal(0.25,0.25)])
-        # 定义层之间的平动弛豫
 
         #   定义保存ts，min和md动作时的文件路径
         save_path_md = None
@@ -313,11 +296,10 @@ class MCTEnv(gym.Env):
             self._to_rotate(self.atoms, -3)
 
         elif self.action_idx == 4:
-            self.atoms.set_constraint(constraint)
-            self.atoms.calc = EMT()
-            dyn = Langevin(self.atoms, 5 * units.fs, self.temperature_K * units.kB, 0.002, trajectory=save_path_md,
-                           logfile='MD.log')
-            dyn.run(self.steps)
+            if self.calculator_method in ['MACE', 'mace', 'Mace']:
+                self.atoms = self.to_calc(self.atoms, calc_type = 'md')
+            elif self.calculator_method in ['LASP', 'Lasp', 'lasp']:
+                self.atoms = self.to_calc(self.atoms, calc_type = 'ssw')
             '''------------The above actions are muti-actions and the following actions contain single-atom actions--------------------------------'''
 
         elif self.action_idx == 5:  # 表面上氧原子的扩散，单原子行为
@@ -350,7 +332,7 @@ class MCTEnv(gym.Env):
         self.atoms, current_energy, current_force = self.to_calc(self.atoms)
         # self.atoms, current_energy, current_force = self.mace_calc(self.atoms)
         print(f"The action is {self.action_idx}, num O2 is {self.n_O2}, num O3 is {self.n_O3}, PdOx x= {len(self.atoms) - len(self.initial_state)}")
-        if (2000 - self.n_O2) * 2 + 3 * self.n_O3 == len(self.atoms) - len(self.initial_state):
+        if (2000 - self.n_O2) * 2 - 3 * self.n_O3 == len(self.atoms) - len(self.initial_state):
             current_energy = current_energy + self.n_O2 * self.E_OO + self.n_O3 * self.E_OOP
         else:
             raise ValueError("The num O2 and num O3 is not 匹配!!!!!!!!!!!!!!!!!!!!")
@@ -1679,41 +1661,117 @@ class MCTEnv(gym.Env):
             return total_sites
     
     def to_calc(self, atoms: ase.Atoms, calc_type = 'opt'):
-        if self.calculator_method in ['LASP', 'lasp', 'Lasp']:
-            if calc_type == 'opt':
-                return self.lasp_calc(atoms)
-            elif calc_type == 'single':
-                return self.lasp_single_calc(atoms)
+        if self.calculator_method in ["LASP", "Lasp", "lasp"]:
+            if calc_type == "opt":
+                atoms, energy, force = self.lasp_calc(atoms)
+                return atoms, energy, force
+            elif calc_type in ["single-point", "single"]:
+                energy = self.lasp_single_calc(atoms)
+                return energy
+            elif calc_type in ["ssw", "SSW"]:
+                energy = self.lasp_ssw_calc(atoms)
+                return energy
+            elif calc_type in ['MD', 'md']:
+                atoms = self.lasp_md_calc(atoms)
+                return atoms
+            elif calc_type in ['TS', 'ts']:
+                barrier = self.lasp_ts_calc(atoms)
+                return barrier
+            else:
+                raise ValueError("No such calc type currently!!!")
             
-        elif self.calculator_method in ['MACE', 'mace', 'Mace']:
-            if calc_type == 'opt':
-                return self.mace_calc(atoms)
-            elif calc_type == 'single':
-                return self.mace_single_calc(atoms)
+        elif self.calculator_method in ["MACE", "Mace", "mace"]:
+            if calc_type == "opt":
+                atoms, energy, force = self.mace_calc(atoms)
+                return atoms, energy, force
+            elif calc_type in ["single-point", "single"]:
+                energy = self.mace_single_calc(atoms)
+                return energy
+            elif calc_type in ['MD', 'md']:
+                atoms = self.mace_md_calc(atoms)
+                return atoms
+            else:
+                raise ValueError("No such calc type currently!!!")
 
-
-    def lasp_calc(self, atoms: ase.Atoms):
-        write_arc([atoms])
-        atoms.calc = LASP(task='local-opt', pot=self.pot, potential='NN D3')
-        energy = atoms.get_potential_energy()
-        force = atoms.get_forces()
-        atoms = read_arc('allstr.arc', index = -1)
-        return atoms, energy, force
-    
-    def mace_calc(self, atoms:ase.Atoms, mace_model_path = None):
-
+    '''-------------MACE_calc--------------------'''
+    def mace_calc(self, atoms):
         from mace.calculators import MACECalculator
+        from ase.calculators.mace_lj import MaceLjCalculator
 
-        model_path = 'my_mace.model'
-
-        calculator = MACECalculator(model_paths=model_path, device='cuda')
-
+        if self.model_path is None:
+            self.model_path = 'my_mace.model'
+        calculator = MACECalculator(model_paths=self.model_path, device='cuda')
         atoms.set_calculator(calculator)
 
         dyn = LBFGS(atoms, trajectory='lbfgs.traj')
         dyn.run(steps = 200, fmax = 0.1)
 
         return atoms, atoms.get_potential_energy(), atoms.get_forces()
+
+    def mace_single_calc(self, atoms):
+        from mace.calculators import MACECalculator
+        from ase.calculators.mace_lj import MaceLjCalculator
+        
+        if self.model_path is None:
+            self.model_path = 'my_mace.model'
+        calculator = MACECalculator(model_paths=self.model_path, device='cuda')
+        atoms.set_calculator(calculator)
+
+        return atoms.get_potential_energy()
+    
+    def mace_md_calc(self, atoms):
+        from mace.calculators import MACECalculator
+        from ase.calculators.mace_lj import MaceLjCalculator
+
+        if self.model_path is None:
+            self.model_path = 'my_mace.model'
+        calculator = MACECalculator(model_paths=self.model_path, device='cuda')
+        atoms.set_calculator(calculator)
+        dyn = Langevin(atoms, 5 * units.fs, self.temperature_K * units.kB, 0.002, trajectory='md.traj',
+                           logfile='MD.log')
+        dyn.run(50)
+        return atoms
+    
+    '''-------------------LASP_calc---------------------------'''    
+    def lasp_calc(self, atoms):
+        write_arc([atoms])
+        atoms.calc = LASP(task='local-opt', pot=self.model_path, potential='NN D3')
+        energy = atoms.get_potential_energy()
+        force = atoms.get_forces()
+        atoms = read_arc('allstr.arc', index = -1)
+        return atoms, energy, force
+    
+    def lasp_single_calc(self, atoms):
+        write_arc([atoms])
+        atoms.calc = LASP(task='single-energy', pot=self.model_path, potential='NN D3')
+        energy = atoms.get_potential_energy()
+        return energy
+    
+    def lasp_ssw_calc(self, atoms):
+        write_arc([atoms])
+        atoms.calc = LASP(task='ssw', pot=self.model_path, potential='NN D3')
+        energy = atoms.get_potential_energy()
+        atoms = read_arc('all.arc', index = -1)
+        return atoms
+    
+    def lasp_md_calc(self, atoms):
+        steps = 50
+        atoms.calc = EMT()
+        dyn = Langevin(atoms, 5 * units.fs, self.temperature_K * units.kB, 0.002, trajectory='md.traj',
+                           logfile='MD.log')
+        dyn.run(steps)
+        return atoms
+    
+    def lasp_ts_calc(self, atoms:List[ase.Atoms]):
+        write_arc(atoms[0])
+        write_arc(atoms)
+        atoms[0].calc = LASP(task='TS', pot=self.model_path, potential='NN D3')
+        if atoms[0].get_potential_energy() == 0:  #没有搜索到过渡态
+            barrier = 0
+        else:
+            barrier, _ = atoms[0].get_potential_energy()
+
+        return barrier
 
     
     def to_constraint(self, atoms): # depending on such type of atoms
@@ -2409,26 +2467,6 @@ class MCTEnv(gym.Env):
         energy_2 = self.to_calc(new_state, calc_type = 'single')
         energy = energy_2 - energy_1
         return energy
-    
-    def lasp_single_calc(self, atom):
-        write_arc([atom])
-        atom.calc = LASP(task='single-energy', pot=self.pot, potential='NN D3')
-        energy = atom.get_potential_energy()
-        force = atom.get_forces()
-        atom = read_arc('allstr.arc', index = -1)
-        return energy
-
-    def mace_single_calc(self, atoms, mace_model_path = None):
-
-        from mace.calculators import MACECalculator
-
-        model_path = 'my_mace.model'
-
-        calculator = MACECalculator(model_paths=model_path, device='cuda')
-
-        atoms.set_calculator(calculator)
-
-        return atoms.get_potential_energy()
     
     def get_O_info(self, slab):
         layer_O_total = []
