@@ -154,8 +154,8 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device(
 
 env = MCTEnv(save_dir = 'save_dir', save_every= 1 ,timesteps = 1000, reaction_H = 0.790, reaction_n = 10, 
              delta_s = -0.371, use_DESW = False,use_kinetic_penalty = False, use_GNN_description = use_GNN_description,
-             calculator_method = 'MACE') 
-# env = gym.make('CartPole-v1')
+             calculate_method = 'MACE', max_save_atoms = 2500, max_observation_atoms = 1000, in_zeolite = True) 
+
 torch.manual_seed(0)
 state_dim = env.observation_space['structures'].shape[0]
 # state_dim = env.observation_space.shape[0]
