@@ -367,10 +367,10 @@ class MCTEnv(gym.Env):
             kickout = True
             reward += -5
 
-        if action == 0:
+        if action == 0 and not self.atoms == previous_atom:
             current_energy = current_energy - self.delta_s
 
-        if action == 8 and action_done:
+        if action == 8 and not self.atoms == previous_atom:
             current_energy = current_energy + self.delta_s
 
         relative_energy = current_energy - previous_energy
