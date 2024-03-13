@@ -376,10 +376,10 @@ class MCTEnv(gym.Env):
             kickout = True
             reward += -5
 
-        if self.action_idx == 0:
+        if self.action_idx == 0 and not self.atoms == previous_atom:
             current_energy = current_energy - self.delta_s
 
-        if self.action_idx == 8 and action_done:
+        if self.action_idx == 8 and not self.atoms == previous_atom:
             current_energy = current_energy + self.delta_s
 
         relative_energy = current_energy - previous_energy
@@ -444,7 +444,7 @@ class MCTEnv(gym.Env):
 
         reward -= 0.5 # 每经历一步timesteps，扣一分
 
-        # _,  exist = self.to_ads_adsorbate(self.atoms)
+        self.atoms = self.del_env_adsorbate(self.atoms)
         if len(self.history['real_energies']) > 11:
             RMSE_energy = self.RMSE(self.history['real_energies'][-10:])
             RMSE_RMSD = self.RMSE(self.RMSD_list[-10:])
@@ -883,6 +883,7 @@ class MCTEnv(gym.Env):
         
         if add_total_sites:
             ads_site = add_total_sites[np.random.randint(len(add_total_sites))]
+            d = self.get_ads_d(ads_site)
             choosed_adsorbate = np.random.randint(len(self.ads_list))
             ads = self.ads_list[choosed_adsorbate]
             
@@ -891,7 +892,6 @@ class MCTEnv(gym.Env):
             if ads:
                 if ads == 2:
                     self.n_O2 -= 1
-                    d = self.get_ads_d(ads_site)
                     O1 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + d))
                     O2 = Atom('O', (ads_site[0], ads_site[1], ads_site[2] + d + 1.21))
                     new_state = new_state + O1
@@ -1787,21 +1787,6 @@ class MCTEnv(gym.Env):
         surfList = [i for n, i in enumerate(surfList) if i not in surfList[:n]]
         constraint = FixAtoms(mask=[a.symbol != 'O' and a.index not in surfList for a in atoms])
         fix = atoms.set_constraint(constraint)
-        '''constraint_list = []
-
-        surfList = self.get_surf_atoms(atoms)
-        layerList = self.get_layer_atoms(atoms)
-        subList = self.get_sub_atoms(atoms)
-        deepList = self.get_deep_atoms(atoms)
-
-        for i in range(len(atoms.get_positions())):
-            if i not in surfList and i not in layerList and i not in subList and i not in deepList:
-                constraint_list.append(i+1)
-
-        # print(f'constraint_list = {constraint_list}')
-
-        constraint = FixAtoms(mask=[a.symbol != 'O' and a.index in constraint_list for a in atoms])
-        fix = atoms.set_constraint(constraint)'''
 
     def exist_too_short_bonds(self,slab):
         exist = False
@@ -2067,35 +2052,63 @@ class MCTEnv(gym.Env):
                 modified_z_list.append(i)
         return modified_z_list
 
+    def del_env_adsorbate(self, slab:Atoms) -> Atoms:
+        slab = self.del_env_O3(slab)
+        slab = self.del_env_O2(slab)
 
-    def to_ads_adsorbate(self, slab):
-        ads = ()
+        return slab
+
+    def del_env_O2(self, slab:Atoms) -> Atoms:
         ana = Analysis(slab)
         OOBonds = ana.get_bonds('O', 'O', unique = True)
         PdOBonds = ana.get_bonds(self.metal_ele, 'O', unique=True)
 
+        Pd_O_list = []
+        del_list = []
+
+        if PdOBonds[0]:
+            for i in PdOBonds[0]:
+                Pd_O_list.extend([i[0], i[1]])
+        
+        if OOBonds[0]:
+            for j in OOBonds[0]:
+                if j[0] not in Pd_O_list and j[1] not in Pd_O_list:
+                    del_list.extend([j[0], j[1]])
+                    self.ads_list.append(2)
+
+        del_list = [i for n,i in enumerate(del_list) if i not in del_list[:n]]
+        print(f"current del env O2 list is {del_list}")
+        del slab[[i for i in range(len(slab)) if i in del_list]]
+
+        self.n_O2 += int(len(del_list)/2)
+
+        return slab
+
+
+    def del_env_O3(self, slab:Atoms) -> Atoms:
+        ana = Analysis(slab)
+        PdOBonds = ana.get_bonds(self.metal_ele, 'O', unique=True)
         OOOangles = ana.get_angles('O', 'O', 'O',unique = True)
 
         Pd_O_list = []
-        ads_list = []
+        del_list = []
         if PdOBonds[0]:
             for i in PdOBonds[0]:
-                Pd_O_list.append(i[0])
-                Pd_O_list.append(i[1])
-        
-        if OOBonds[0]:  # 定义环境中的氧气分子
-            for i in OOBonds[0]:
-                if i[0] not in Pd_O_list and i[1] not in Pd_O_list:
-                    ads_list.append(i)
+                Pd_O_list.extend([i[0], i[1]])
 
         if OOOangles[0]:
             for j in OOOangles[0]:
                 if j[0] not in Pd_O_list and j[1] not in Pd_O_list and j[2] not in Pd_O_list:
-                    ads_list.append(i)
+                    del_list.extend([j[0], j[1], j[2]])
+                    self.ads_list.append(3)
 
-        if ads_list:
-            ads = ads_list[np.random.randint(len(ads_list))]
-        return ads, ads_list
+        del_list = [i for n,i in enumerate(del_list) if i not in del_list[:n]]
+        print(f"current del env O3 list is {del_list}")
+        del slab[[i for i in range(len(slab)) if i in del_list]]
+
+        self.n_O3 += int(len(del_list)/3)
+        
+        return slab
     
     def to_desorb_adsorbate(self, slab):
         desorb = ()
